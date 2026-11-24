@@ -1,0 +1,20 @@
+[package]
+name = "t3-native-sqlite"
+version = "0.1.0"
+edition = "2021"
+description = "Rust N-API SQLite worker pool for t3 serve: 4 readers + 1 writer + 1 WAL checkpoint on plain OS threads (zero V8 isolates)"
+
+[lib]
+name = "t3_native_sqlite"
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", features = ["napi6"] }
+napi-derive = "3"
+rusqlite = { version = "0.43", features = ["bundled"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

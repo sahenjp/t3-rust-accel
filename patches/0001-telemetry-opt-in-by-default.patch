@@ -1,0 +1,51 @@
+diff --git a/apps/server/src/telemetry/AnalyticsService.ts b/apps/server/src/telemetry/AnalyticsService.ts
+index eb222ae743..520ff5eeed 100644
+--- a/apps/server/src/telemetry/AnalyticsService.ts
++++ b/apps/server/src/telemetry/AnalyticsService.ts
+@@ -71,7 +71,7 @@ const TelemetryEnvConfig = Config.all({
+   posthogHost: Config.String("T3CODE_POSTHOG_HOST").pipe(
+     Config.withDefault("https://ingest.t3.codes"),
+   ),
+-  enabled: Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(Config.withDefault(true)),
++  enabled: Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(Config.withDefault(false)),
+   flushBatchSize: Config.Number("T3CODE_TELEMETRY_FLUSH_BATCH_SIZE").pipe(Config.withDefault(20)),
+   maxBufferedEvents: Config.Number("T3CODE_TELEMETRY_MAX_BUFFERED_EVENTS").pipe(
+     Config.withDefault(1_000),
+@@ -134,7 +134,7 @@ export const make = Effect.gen(function* () {
+       return Effect.succeed(false);
+     const preference = hostEnvironment.T3CODE_TELEMETRY_ENABLED;
+     return Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(
+-      Config.withDefault(true),
++      Config.withDefault(false),
+       Effect.provideService(
+         ConfigProvider.ConfigProvider,
+         ConfigProvider.fromEnv({
+diff --git a/packages/shared/src/otelEnvironment.test.ts b/packages/shared/src/otelEnvironment.test.ts
+index 21df52609f..7fbb08a712 100644
+--- a/packages/shared/src/otelEnvironment.test.ts
++++ b/packages/shared/src/otelEnvironment.test.ts
+@@ -387,8 +387,9 @@ describe("OtelEnvironment", () => {
+ });
+ 
+ describe("isRelayTracingEnabled", () => {
+-  it("defaults on and respects the T3CODE SDK override of the standard kill switch", () => {
+-    assert.isTrue(OtelEnvironment.isRelayTracingEnabled({}));
++  it("defaults off, enables on explicit T3CODE_TELEMETRY_ENABLED=true, and respects the T3CODE SDK override of the standard kill switch", () => {
++    assert.isFalse(OtelEnvironment.isRelayTracingEnabled({}));
++    assert.isTrue(OtelEnvironment.isRelayTracingEnabled({ T3CODE_TELEMETRY_ENABLED: "true" }));
+     assert.isFalse(OtelEnvironment.isRelayTracingEnabled({ OTEL_SDK_DISABLED: "true" }));
+     assert.isTrue(
+       OtelEnvironment.isRelayTracingEnabled({
+diff --git a/packages/shared/src/otelEnvironment.ts b/packages/shared/src/otelEnvironment.ts
+index 95392206a8..39fdbd3337 100644
+--- a/packages/shared/src/otelEnvironment.ts
++++ b/packages/shared/src/otelEnvironment.ts
+@@ -324,7 +324,7 @@ export const isRelayTracingEnabled = (env: Readonly<Record<string, string | unde
+     telemetry: flag("T3CODE_TELEMETRY_ENABLED", T3CODE_TRUE, T3CODE_FALSE, String),
+   }).pipe(
+     Effect.map(
+-      ({ telemetry, t3, spec }) => telemetry.value !== false && !(t3.value ?? spec.value ?? false),
++      ({ telemetry, t3, spec }) => telemetry.value === true && !(t3.value ?? spec.value ?? false),
+     ),
+     Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord(env))),
+     Effect.orDie,
