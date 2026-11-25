@@ -1,3 +1,89 @@
+diff --git a/apps/server/scripts/cli.ts b/apps/server/scripts/cli.ts
+index c4fa501357..3e4f685953 100644
+--- a/apps/server/scripts/cli.ts
++++ b/apps/server/scripts/cli.ts
+@@ -67,6 +67,49 @@ const applyDevelopmentIconOverrides = Effect.fn("applyDevelopmentIconOverrides")
+   yield* Effect.log("[cli] Applied development icon overrides to dist/client");
+ });
+ 
++const preservePreviousClientAssets = Effect.fn("preservePreviousClientAssets")(function* (
++  clientTarget: string,
++) {
++  const path = yield* Path.Path;
++  const fs = yield* FileSystem.FileSystem;
++  const manifestPath = path.join(clientTarget, ".vite", "manifest.json");
++  if (!(yield* fs.exists(manifestPath))) return undefined;
++  const raw = yield* fs.readFileString(manifestPath).pipe(Effect.orElseSucceed(() => ""));
++  if (!raw) return undefined;
++  let files: ReadonlyArray<string> = [];
++  try {
++    const parsed = JSON.parse(raw) as Record<
++      string,
++      {
++        readonly file?: string;
++        readonly css?: ReadonlyArray<string>;
++        readonly assets?: ReadonlyArray<string>;
++      }
++    >;
++    files = Object.values(parsed).flatMap((entry) => [
++      ...(entry.file ? [entry.file] : []),
++      ...(entry.css ?? []),
++      ...(entry.assets ?? []),
++    ]);
++  } catch {
++    return undefined;
++  }
++  const uniqueFiles = [...new Set(files)].filter(
++    (rel) => rel.startsWith("assets/") && !rel.includes(".."),
++  );
++  if (uniqueFiles.length === 0) return undefined;
++  const backupDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-prev-client-assets-" });
++  for (const rel of uniqueFiles) {
++    const src = path.join(clientTarget, rel);
++    if (yield* fs.exists(src)) {
++      const dst = path.join(backupDir, rel);
++      yield* fs.makeDirectory(path.dirname(dst), { recursive: true });
++      yield* fs.copyFile(src, dst);
++    }
++  }
++  return { backupDir, files: uniqueFiles } as const;
++});
++
+ const buildCmd = Command.make(
+   "build",
+   {
+@@ -78,6 +121,9 @@ const buildCmd = Command.make(
+       const fs = yield* FileSystem.FileSystem;
+       const repoRoot = yield* RepoRoot;
+       const serverDir = path.join(repoRoot, "apps/server");
++      const webDist = path.join(repoRoot, "apps/web/dist");
++      const clientTarget = path.join(serverDir, "dist/client");
++      const previousAssets = yield* preservePreviousClientAssets(clientTarget);
+ 
+       yield* Effect.log("[cli] Running tsdown...");
+       yield* runCommand(
+@@ -89,11 +135,18 @@ const buildCmd = Command.make(
+         }),
+       );
+ 
+-      const webDist = path.join(repoRoot, "apps/web/dist");
+-      const clientTarget = path.join(serverDir, "dist/client");
+-
+       if (yield* fs.exists(webDist)) {
+         yield* fs.copy(webDist, clientTarget);
++        if (previousAssets) {
++          for (const rel of previousAssets.files) {
++            const dst = path.join(clientTarget, rel);
++            const src = path.join(previousAssets.backupDir, rel);
++            if (!(yield* fs.exists(dst)) && (yield* fs.exists(src))) {
++              yield* fs.makeDirectory(path.dirname(dst), { recursive: true });
++              yield* fs.copyFile(src, dst);
++            }
++          }
++        }
+         yield* applyDevelopmentIconOverrides(repoRoot, serverDir);
+         yield* Effect.log("[cli] Bundled web app into dist/client");
+       } else {
 diff --git a/apps/server/src/cli/config.ts b/apps/server/src/cli/config.ts
 index 0d4e26b380..6e2b16cc9b 100644
 --- a/apps/server/src/cli/config.ts
@@ -25,6 +111,142 @@ index 0d4e26b380..6e2b16cc9b 100644
    const explicitHost = resolveOptionPrecedence(
      normalizedFlags.host,
      Option.fromUndefinedOr(env.host),
+diff --git a/apps/server/src/http.test.ts b/apps/server/src/http.test.ts
+index 0bfd8b6522..68ea25e6ca 100644
+--- a/apps/server/src/http.test.ts
++++ b/apps/server/src/http.test.ts
+@@ -557,6 +557,49 @@ it.layer(
+     }),
+   );
+ 
++  it.effect("returns 404 for missing asset files instead of SPA index.html and refreshes manifest assets after rebuild", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const staticDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-static-spa-fallback-" });
++      yield* fs.writeFileString(path.join(staticDir, "index.html"), "<html>spa shell</html>");
++      yield* fs.makeDirectory(path.join(staticDir, "assets"), { recursive: true });
++      yield* fs.makeDirectory(path.join(staticDir, ".vite"), { recursive: true });
++      yield* fs.writeFileString(
++        path.join(staticDir, ".vite", "manifest.json"),
++        JSON.stringify({ "index.html": { file: "assets/index-11111111.js" } }),
++      );
++      const request = yield* makeStaticRequest(staticDir);
++
++      const missingChunk = yield* request("/assets/lazy-deadbeef.js");
++      expect(missingChunk.status).toBe(404);
++      expect(missingChunk.headers["cache-control"]).toBe("no-cache");
++
++      const dottedSpaRoute = yield* request("/threads/thread.with.dots", {
++        headers: { accept: "text/html,application/xhtml+xml" },
++      });
++      expect(dottedSpaRoute.status).toBe(200);
++      expect(yield* dottedSpaRoute.text).toBe("<html>spa shell</html>");
++
++      // Simulate an in-place rebuild writing a new hashed chunk and updating manifest.json.
++      yield* fs.writeFileString(
++        path.join(staticDir, "assets", "lazy-22222222.js"),
++        "export default 42;",
++      );
++      yield* fs.writeFileString(
++        path.join(staticDir, ".vite", "manifest.json"),
++        JSON.stringify({
++          "index.html": { file: "assets/index-11111111.js" },
++          "lazy.js": { file: "assets/lazy-22222222.js" },
++        }),
++      );
++      const rebuiltChunk = yield* request("/assets/lazy-22222222.js");
++      expect(rebuiltChunk.status).toBe(200);
++      expect(rebuiltChunk.headers["cache-control"]).toBe("public, max-age=31536000, immutable");
++      expect(yield* rebuiltChunk.text).toBe("export default 42;");
++    }),
++  );
++
+   it.effect("closes static descriptors after GET, HEAD, 304, and request cancellation", () =>
+     Effect.gen(function* () {
+       const fs = yield* FileSystem.FileSystem;
+diff --git a/apps/server/src/http.ts b/apps/server/src/http.ts
+index 258a99887e..5d50dd664a 100644
+--- a/apps/server/src/http.ts
++++ b/apps/server/src/http.ts
+@@ -635,14 +635,12 @@ const decodeBuildManifest = Schema.decodeUnknownEffect(
+   ),
+ );
+ 
+-const loadImmutableBuildAssets = Effect.gen(function* () {
+-  const config = yield* ServerConfig.ServerConfig;
+-  const staticDir =
+-    config.staticDir ?? (config.devUrl ? yield* ServerConfig.resolveStaticDir() : undefined);
+-  if (!staticDir) return new Set<string>();
+-  const fileSystem = yield* FileSystem.FileSystem;
+-  const path = yield* Path.Path;
+-  return yield* fileSystem.readFileString(path.join(staticDir, ".vite", "manifest.json")).pipe(
++const readImmutableBuildAssets = (
++  fileSystem: FileSystem.FileSystem,
++  path: Path.Path,
++  staticDir: string,
++) =>
++  fileSystem.readFileString(path.join(staticDir, ".vite", "manifest.json")).pipe(
+     Effect.flatMap(decodeBuildManifest),
+     Effect.map(
+       (manifest) =>
+@@ -656,6 +654,15 @@ const loadImmutableBuildAssets = Effect.gen(function* () {
+     ),
+     Effect.orElseSucceed(() => new Set<string>()),
+   );
++
++const loadImmutableBuildAssets = Effect.gen(function* () {
++  const config = yield* ServerConfig.ServerConfig;
++  const staticDir =
++    config.staticDir ?? (config.devUrl ? yield* ServerConfig.resolveStaticDir() : undefined);
++  if (!staticDir) return new Set<string>();
++  const fileSystem = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  return yield* readImmutableBuildAssets(fileSystem, path, staticDir);
+ });
+ 
+ const openStaticFile = Effect.fn("openStaticFile")(function* (filePath: string) {
+@@ -693,7 +700,7 @@ const SPA_FRAME_HEADERS = {
+ };
+ 
+ const handleStaticAndDevRequest = Effect.fn("handleStaticAndDevRequest")(
+-  function* (immutableBuildAssets: ReadonlySet<string>) {
++  function* (immutableBuildAssets: Set<string>) {
+     const request = yield* HttpServerRequest.HttpServerRequest;
+     const url = requestUrl(request);
+ 
+@@ -763,6 +770,13 @@ const handleStaticAndDevRequest = Effect.fn("handleStaticAndDevRequest")(
+ 
+     let opened = yield* openStaticFile(filePath);
+     if (!opened) {
++      const wantsHtml = request.headers["accept"]?.includes("text/html") ?? false;
++      if (ext !== "" && !wantsHtml) {
++        return HttpServerResponse.text("Not Found", {
++          status: 404,
++          headers: { "Cache-Control": "no-cache" },
++        });
++      }
+       filePath = path.resolve(staticRoot, "index.html");
+       opened = yield* openStaticFile(filePath);
+       if (!opened) {
+@@ -775,10 +789,13 @@ const handleStaticAndDevRequest = Effect.fn("handleStaticAndDevRequest")(
+ 
+     // A hash-like name is not enough: custom static files can use the same naming pattern.
+     const relativePath = path.relative(staticRoot, filePath).replaceAll("\\", "/");
+-    const immutable =
+-      !isHtml &&
+-      /^assets\/.+-[\w-]{8}\.[^/]+$/.test(relativePath) &&
+-      immutableBuildAssets.has(relativePath);
++    const looksHashedAsset = !isHtml && /^assets\/.+-[\w-]{8}\.[^/]+$/.test(relativePath);
++    if (looksHashedAsset && !immutableBuildAssets.has(relativePath)) {
++      const fileSystem = yield* FileSystem.FileSystem;
++      const refreshed = yield* readImmutableBuildAssets(fileSystem, path, staticRoot);
++      for (const asset of refreshed) immutableBuildAssets.add(asset);
++    }
++    const immutable = looksHashedAsset && immutableBuildAssets.has(relativePath);
+     const cacheControl = immutable ? "public, max-age=31536000, immutable" : "no-cache";
+     const validators = (info: FileSystem.File.Info) => {
+       // Deployments can preserve HTML size and mtime while changing its bundle URLs.
 diff --git a/apps/server/src/mcp/MakiMcpService.ts b/apps/server/src/mcp/MakiMcpService.ts
 new file mode 100644
 index 0000000000..70fdacd51e
@@ -3167,43 +3389,6 @@ index b657a2b813..8555a3e2d9 100644
            // oxlint-disable-next-line require-yield -- never yields, so no prompt reaches the API
            prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
              await waitForAbortSignal(abort.signal);
-diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index 13db759c48..916cca3109 100644
---- a/apps/server/src/server.ts
-+++ b/apps/server/src/server.ts
-@@ -263,6 +263,24 @@ const HTTP_ROUTER_CONFIG = {
-   maxParamLength: 512,
- } as const;
- 
-+// Opt-in periodic GC for long-running servers; gc() only exists under --expose-gc.
-+const IDLE_GC_MS = (() => {
-+  const parsed = Number.parseInt(process.env.T3_IDLE_GC_MS ?? "", 10);
-+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
-+})();
-+const layerIdleGc = Layer.effectDiscard(
-+  Effect.acquireRelease(
-+    Effect.sync(() => {
-+      const gc = (globalThis as { gc?: () => void }).gc;
-+      if (IDLE_GC_MS === undefined || typeof gc !== "function") return undefined;
-+      const timer = setInterval(gc, IDLE_GC_MS);
-+      timer.unref();
-+      return timer;
-+    }),
-+    (timer) => Effect.sync(() => timer !== undefined && clearInterval(timer)),
-+  ),
-+);
-+
- // Skip Effect's default 20 s grace; WebSocket scope finalizers already close connections gracefully.
- const HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS = 0;
- const layerResourceAttribution = ResourceAttribution.layer;
-@@ -1416,6 +1434,7 @@ const layerMakeServer = Layer.unwrap(
-       layerRoutes,
-       layerHttpListening,
-       layerDesktopReadySignal,
-+      layerIdleGc,
-       layerRuntimeState.pipe(Layer.provide(layerLauncher)),
-       layerTailscaleServe,
-       layerCloudDesiredLinkReconcile,
 diff --git a/apps/server/src/vcs/VcsStatusBroadcaster.ts b/apps/server/src/vcs/VcsStatusBroadcaster.ts
 index e232d3ce69..c80700e69e 100644
 --- a/apps/server/src/vcs/VcsStatusBroadcaster.ts
@@ -3269,6 +3454,141 @@ index 2bec8830d8..08bab0b86e 100644
        clean: true,
        // SEA can only resolve built-ins; keep dynamic imports inside each emitted module.
        ...(packExecutable ? { outputOptions: { codeSplitting: false } } : {}),
+diff --git a/apps/web/src/components/chat/MermaidDiagram.tsx b/apps/web/src/components/chat/MermaidDiagram.tsx
+index 520f12048f..ab200bbe8d 100644
+--- a/apps/web/src/components/chat/MermaidDiagram.tsx
++++ b/apps/web/src/components/chat/MermaidDiagram.tsx
+@@ -3,11 +3,14 @@ import type { DiagramType, MathResolver } from "pele/lazy";
+ import { T, useGT, Var } from "gt-react";
+ import { use, useState } from "react";
+ 
++import { chunkLoadState, isChunkLoadError } from "../../lib/chunkReloadGuard";
+ import { serializeCodeBlockToMarkdown } from "../../markdown-clipboard";
+ import { Button } from "../ui/button";
+ 
+ type Pele = typeof import("pele/lazy");
+-type PeleLoad = { readonly status: "loaded"; readonly pele: Pele } | { readonly status: "failed" };
++type PeleLoad =
++  | { readonly status: "loaded"; readonly pele: Pele }
++  | { readonly status: "failed"; readonly chunkError: boolean };
+ 
+ let coreLoad: Promise<PeleLoad> | null = null;
+ // Each diagram type is its own chunk, so a chat with one flowchart loads only
+@@ -16,8 +19,13 @@ const diagramLoads = new Map<DiagramType, Promise<PeleLoad>>();
+ 
+ function loadCore(): Promise<PeleLoad> {
+   coreLoad ??= import("pele/lazy").then(
+-    (pele): PeleLoad => ({ status: "loaded", pele }),
+-    (): PeleLoad => ({ status: "failed" }),
++    (pele): PeleLoad =>
++      // Vite's preloadError handler resolves dynamic imports to undefined when a reload is scheduled.
++      pele ? { status: "loaded", pele } : { status: "failed", chunkError: true },
++    (error: unknown): PeleLoad => ({
++      status: "failed",
++      chunkError: isChunkLoadError(error) || chunkLoadState.reloadScheduled,
++    }),
+   );
+   return coreLoad;
+ }
+@@ -26,8 +34,14 @@ function loadDiagramType(pele: Pele, type: DiagramType): Promise<PeleLoad> {
+   let load = diagramLoads.get(type);
+   if (!load) {
+     load = pele.load(type).then(
+-      (): PeleLoad => ({ status: "loaded", pele }),
+-      (): PeleLoad => ({ status: "failed" }),
++      (loaded): PeleLoad =>
++        loaded
++          ? { status: "loaded", pele }
++          : { status: "failed", chunkError: chunkLoadState.reloadScheduled },
++      (error: unknown): PeleLoad => ({
++        status: "failed",
++        chunkError: isChunkLoadError(error) || chunkLoadState.reloadScheduled,
++      }),
+     );
+     diagramLoads.set(type, load);
+   }
+@@ -261,6 +275,10 @@ export function MermaidDiagram({
+         message={gt("The diagram renderer failed to load.")}
+         source={source}
+         onRetry={() => {
++          if (load.chunkError) {
++            window.location.reload();
++            return;
++          }
+           if (core.status === "failed") coreLoad = null;
+           if (type) diagramLoads.delete(type);
+           setAttempt((attempt) => attempt + 1);
+diff --git a/apps/web/src/lib/chunkReloadGuard.test.ts b/apps/web/src/lib/chunkReloadGuard.test.ts
+index 3a16834abc..66d9f1beec 100644
+--- a/apps/web/src/lib/chunkReloadGuard.test.ts
++++ b/apps/web/src/lib/chunkReloadGuard.test.ts
+@@ -1,6 +1,10 @@
+ import { describe, expect, it, vi } from "vite-plus/test";
+ 
+-import { isChunkLoadError, reloadOnceForChunkLoadError } from "./chunkReloadGuard";
++import {
++  isChunkLoadError,
++  reloadOnceForChunkLoadError,
++  resolveChunkReloadBuildKey,
++} from "./chunkReloadGuard";
+ 
+ function createStorageStub(): Storage {
+   const store = new Map<string, string>();
+@@ -51,6 +55,26 @@ describe("reloadOnceForChunkLoadError", () => {
+     expect(reloadOnceForChunkLoadError(blocked, reload)).toBe(false);
+     expect(reload).not.toHaveBeenCalled();
+   });
++
++  it("distinguishes in-place rebuilds that share APP_VERSION by bundled entry hash", () => {
++    const storage = createStorageStub();
++    const reload = vi.fn();
++    const firstBuild = resolveChunkReloadBuildKey(
++      "0.1.11",
++      "http://127.0.0.1:3773/assets/index-oldhash1.js",
++    );
++    const rebuiltBuild = resolveChunkReloadBuildKey(
++      "0.1.11",
++      "http://127.0.0.1:3773/assets/index-newhash2.js",
++    );
++
++    expect(firstBuild).toBe("0.1.11:index-oldhash1.js");
++    expect(rebuiltBuild).toBe("0.1.11:index-newhash2.js");
++    expect(reloadOnceForChunkLoadError(() => storage, reload, firstBuild)).toBe(true);
++    expect(reloadOnceForChunkLoadError(() => storage, reload, firstBuild)).toBe(false);
++    expect(reloadOnceForChunkLoadError(() => storage, reload, rebuiltBuild)).toBe(true);
++    expect(reload).toHaveBeenCalledTimes(2);
++  });
+ });
+ 
+ describe("isChunkLoadError", () => {
+diff --git a/apps/web/src/lib/chunkReloadGuard.ts b/apps/web/src/lib/chunkReloadGuard.ts
+index 43034ccb57..e68ee097cd 100644
+--- a/apps/web/src/lib/chunkReloadGuard.ts
++++ b/apps/web/src/lib/chunkReloadGuard.ts
+@@ -1,11 +1,21 @@
+ // Deploys and desktop server swaps can invalidate lazy chunks; one reload fetches the fresh index.
+-// Keyed by build and kept across boots: a chunk loaded after boot can fail on every visit.
++// Keyed by build (including the bundled entry asset hash) and kept across boots: a chunk loaded
++// after boot can fail on every visit, while an in-place rebuild with the same APP_VERSION gets a
++// new entry hash and can reload once again.
+ const CHUNK_RELOAD_GUARD_KEY = "t3code:chunk-load-reloaded";
+ 
++export function resolveChunkReloadBuildKey(
++  appVersion = import.meta.env.APP_VERSION,
++  moduleUrl = import.meta.url,
++): string {
++  const entryAsset = /\/assets\/(index-[^/?#]+\.js)(?:[?#]|$)/.exec(moduleUrl)?.[1];
++  return entryAsset ? `${appVersion}:${entryAsset}` : appVersion;
++}
++
+ export function reloadOnceForChunkLoadError(
+   getStorage: () => Storage = () => window.sessionStorage,
+   reload: () => void = () => window.location.reload(),
+-  build = import.meta.env.APP_VERSION,
++  build = resolveChunkReloadBuildKey(),
+ ): boolean {
+   let alreadyReloaded: boolean;
+   try {
 diff --git a/packages/provider-acp/src/server/adapter.ts b/packages/provider-acp/src/server/adapter.ts
 index e13fa3d736..2442e77a40 100644
 --- a/packages/provider-acp/src/server/adapter.ts
