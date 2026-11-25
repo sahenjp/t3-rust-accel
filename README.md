@@ -19,7 +19,7 @@
 | `crates/t3-native-sqlite/` | `index.mjs` 経由で使うネイティブ sqlite バインディング (`T3_NATIVE_SQLITE_PATH`) |
 | `crates/t3-maki-tools/` | `code_index` / `code_slice` / `code_grep` の CLI (`T3_MAKI_TOOLS_BIN`) |
 | `systemd/` | user unit の drop-in テンプレート (phase 2 サーバとメモリ調整)。`%h` は systemd がユーザーのホームディレクトリに展開 |
-| `patches/` | T3 Code サーバのテレメトリ、MCP 登録、Antigravity 連携のソースパッチ |
+| `patches/` | T3 Code サーバのテレメトリ、MCP 登録、Antigravity 連携、T3 Connect E2EE のソースパッチ |
 | `scripts/` | 共通のビルド・起動コマンドと Linux の systemd 設定スクリプト |
 
 ## ビルドと起動
@@ -96,6 +96,34 @@ Environment=T3CODE_OTEL_SDK_DISABLED=true
 サーバのソースに `patches/0003-use-installed-antigravity-cli.patch` を適用した状態で接続します。Google 公式の `agy` を別途インストールし、T3 Code のプロバイダ設定に実行ファイルのパスを指定するか、サーバの `PATH` に含めます。
 
 T3 Code は公式 CLI を介して認証とセッションを扱います。利用履歴はローカルファイルから読み取ります。残りクォータの表示と、T3 Code からの CLI の自動ダウンロードは無効です。
+
+## T3 Connect のエンドツーエンド暗号化
+
+`0004` のパッチは T3 Connect の管理トンネルに TLS 1.3 の通信を通します。
+Cloudflare の入口には暗号化済みの WebSocket フレームが届きます。
+クライアントは事前に受け取ったホスト証明書と照合し、ホストはクライアント証明書を検証します。
+
+1. ホストの証明書ディレクトリに `host-key.pem`、`host-cert.pem`、`client-ca.pem` を置きます。
+   各クライアントには自身の `client-key.pem`、CA が発行した `client-cert.pem`、ホストから
+   別の信頼できる経路で受け取った `host-cert.pem` を置きます。ホスト証明書の用途は
+   `serverAuth`、クライアント証明書は `clientAuth` です。秘密鍵は各機器で生成・保管します。
+2. ホストで `T3CODE_CONNECT_E2EE_CERT_DIR` を証明書ディレクトリに、`T3CODE_CONNECT_E2EE_PORT`
+   を未使用のループバックポートに設定して、パッチ適用済みのサーバを起動します。
+   この入口は T3 Connect のホスト情報と署名付きヘルスチェックにだけ通常の HTTP で応答します。
+3. 接続する PC で次を実行し、表示されたローカル URL をブラウザで開きます。
+   ホストで `t3 auth pairing create --base-url http://127.0.0.1:3774` を実行すると、
+   この URL 用の一度限りのペアリングリンクを発行できます。
+
+```sh
+t3 connect e2ee --endpoint https://your-connect-hostname --credentials /path/to/client-certs
+```
+
+`--endpoint` には T3 Connect の環境 URL を指定します。ローカルポートを変えるときは
+`--port` とペアリングリンクに同じ値を指定します。証明書を更新したらホスト証明書を再配布します。
+
+このモードを有効にした環境は、パッチ適用済み CLI を経由する PC 上のブラウザで利用できます。
+公式アプリから従来方式で接続すると認証が拒否されます。管理トンネル経由の公開 Webhook も停止します。
+プッシュ通知を有効にしている場合、アクティビティ用の通知データは別経路を通ります。
 
 ## セッションは置き換えても残る
 

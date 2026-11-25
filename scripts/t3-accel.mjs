@@ -57,6 +57,7 @@ function packageBuild(outputPath) {
       join(root, "patches/0001-telemetry-opt-in-by-default.patch"),
       join(root, "patches/0002-scope-mcp-registration-buffer.patch"),
       join(root, "patches/0003-use-installed-antigravity-cli.patch"),
+      join(root, "patches/0004-t3-connect-e2ee.patch"),
       join(root, "patches/T3CODE-LICENSE"),
     ]) {
       const copy = join(packageRoot, relative(root, file));

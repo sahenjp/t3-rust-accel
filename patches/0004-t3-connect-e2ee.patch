@@ -1,0 +1,641 @@
+diff --git a/apps/server/package.json b/apps/server/package.json
+index 89d5cef81770ce7104044af6350bf5a79f591f40..703c1e2f34acff22633823abd988c9509dbce5e3 100644
+--- a/apps/server/package.json
++++ b/apps/server/package.json
+@@ -75,6 +75,7 @@
+     "stream-json": "3.7.0",
+     "transcribe-cpp": "0.4.1",
+     "undici": "catalog:",
++    "ws": "catalog:",
+     "yaml": "catalog:",
+     "yauzl": "^3.4.0",
+     "zod": "^4.6.5"
+@@ -96,6 +97,7 @@
+     "@t3tools/web": "workspace:*",
+     "@types/node": "catalog:",
+     "@types/proper-lockfile": "^4.1.4",
++    "@types/ws": "catalog:",
+     "@types/yauzl": "^3.4.0",
+     "effect-acp": "workspace:*",
+     "effect-codex-app-server": "workspace:*",
+diff --git a/apps/server/src/cli/connect.ts b/apps/server/src/cli/connect.ts
+index 8ef202c2d014f84587fc753498f2570d0bc76a51..193fb9f554e58ac29477e9975868c7caaca3e8b1 100644
+--- a/apps/server/src/cli/connect.ts
++++ b/apps/server/src/cli/connect.ts
+@@ -1,6 +1,7 @@
+ import {
+   AuthRelayReadScope,
+   AuthRelayWriteScope,
++  PortSchema,
+   type EnvironmentConnectReachability,
+   formatConnectReachable,
+   type RelayClientInstallProgressEvent,
+@@ -32,6 +33,7 @@ import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+ import * as BootService from "../cloud/bootService.ts";
+ import * as CliState from "../cloud/CliState.ts";
++import * as ConnectE2ee from "../cloud/connectE2ee.ts";
+ import * as CliTokenManager from "../cloud/CliTokenManager.ts";
+ import { formatReachabilityFailure } from "../cloud/ConnectReachability.ts";
+ import { filterRelayResponse } from "../cloud/relayResponse.ts";
+@@ -816,8 +818,39 @@ const connectLogoutCommand = Command.make("logout", {
+   ),
+ );
+
++const connectE2eeCommand = Command.make("e2ee", {
++  endpoint: Flag.String("endpoint").pipe(
++    Flag.withDescription("The HTTPS origin of the T3 Connect tunnel."),
++  ),
++  credentials: Flag.String("credentials").pipe(
++    Flag.withDescription(
++      "Directory containing the client key, client certificate, and pinned host certificate.",
++    ),
++  ),
++  port: Flag.Int("port").pipe(
++    Flag.withSchema(PortSchema),
++    Flag.withDefault(3774),
++    Flag.withDescription("Local T3 endpoint port."),
++  ),
++}).pipe(
++  Command.withDescription("Open a local port to an end-to-end encrypted T3 Connect environment."),
++  Command.withHandler(({ endpoint, credentials, port }) =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const client = yield* Effect.acquireRelease(
++          Effect.promise(() => ConnectE2ee.startClient({ endpoint, directory: credentials, port })),
++          (client) => Effect.promise(client.close),
++        );
++        yield* Console.log(`T3 Connect E2EE listening on http://127.0.0.1:${client.port}`);
++        return yield* Effect.never;
++      }),
++    ),
++  ),
++);
++
+ // `t3 connect` itself is `t3 up --connect`, in up.ts.
+ export const connectSubcommands = [
++  connectE2eeCommand,
+   connectLoginCommand,
+   connectLinkCommand,
+   connectPublishCommand,
+diff --git a/apps/server/src/cloud/CloudLink.ts b/apps/server/src/cloud/CloudLink.ts
+index 6c9c70246b67e7b081f0eb088b37de40021bc1ff..1c25e084fe35534d02f4b113b64786dde4347582 100644
+--- a/apps/server/src/cloud/CloudLink.ts
++++ b/apps/server/src/cloud/CloudLink.ts
+@@ -59,6 +59,7 @@ import * as Semaphore from "effect/Semaphore";
+ import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
+ import type * as HttpClientError from "effect/http/HttpClientError";
+ import * as HttpServer from "effect/http/HttpServer";
++import { hostConfig as connectE2eeHostConfig } from "./connectE2ee.ts";
+
+ import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+@@ -590,7 +591,8 @@ const make = Effect.gen(function* () {
+       return yield* new CloudLinkInternalError({ operation: "resolve-server-origin" });
+     }
+     const { origin } = parseManagedEndpointLocalOrigin(
+-      `http://${loopbackUrlHostForAddress(address)}:${address.port}`,
++      connectE2eeHostConfig()?.origin ??
++        `http://${loopbackUrlHostForAddress(address)}:${address.port}`,
+     );
+     if (!isLoopbackEndpointOrigin(origin)) {
+       return yield* new CloudLinkOriginInvalidError({ origin: "local" });
+@@ -717,6 +719,7 @@ const make = Effect.gen(function* () {
+     "environment.cloud.startManagedCloudTunnelIfOriginConfirmed",
+   )(function* (localOrigin: string, options?: { readonly requireConfirmedOrigin?: boolean }) {
+     const requireConfirmedOrigin = options?.requireConfirmedOrigin ?? true;
++    if (!requireConfirmedOrigin && connectE2eeHostConfig()) return false;
+     const parsedOrigin = yield* Effect.try({
+       try: () => parseManagedEndpointLocalOrigin(localOrigin),
+       catch: () => new CloudLinkOriginInvalidError({ origin: "local" }),
+@@ -1584,6 +1587,8 @@ const make = Effect.gen(function* () {
+
+   const mintCredential = Effect.fn("environment.cloud.mintCredential")(
+     function* (request: RelayCloudMintCredentialRequest) {
++      if (connectE2eeHostConfig())
++        return yield* new CloudLinkProofRejectedError({ request: "mint" });
+       const cloudMintPublicKey = yield* secrets
+         .get(CLOUD_MINT_PUBLIC_KEY)
+         .pipe(
+diff --git a/apps/server/src/cloud/connectE2ee.test.ts b/apps/server/src/cloud/connectE2ee.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..351a884a7cdd57cf028a338f1b5d1d1e346a4935
+--- /dev/null
++++ b/apps/server/src/cloud/connectE2ee.test.ts
+@@ -0,0 +1,194 @@
++// @effect-diagnostics nodeBuiltinImport:off globalFetch:off
++import { execFileSync } from "node:child_process";
++import { once } from "node:events";
++import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
++import { createServer as createHttpServer } from "node:http";
++import { createServer as createHttpsServer } from "node:https";
++import type { AddressInfo, Server } from "node:net";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { getCACertificates, setDefaultCACertificates } from "node:tls";
++import { expect, it } from "vite-plus/test";
++import { createWebSocketStream, WebSocket, WebSocketServer } from "ws";
++import { startClient, startIngress } from "./connectE2ee.ts";
++
++const listen = async (server: Server) => {
++  server.listen(0, "127.0.0.1");
++  await once(server, "listening");
++  return (server.address() as AddressInfo).port;
++};
++
++it("carries HTTP and WebSocket through an opaque edge, with pinned host and client certificates", async () => {
++  const path = await mkdtemp(join(tmpdir(), "t3-e2ee-"));
++  const trusted = getCACertificates("default");
++  await using cleanup = new AsyncDisposableStack();
++  cleanup.defer(() => rm(path, { recursive: true, force: true }));
++  cleanup.defer(() => setDefaultCACertificates(trusted));
++
++  const openssl = (...args: string[]) =>
++    execFileSync("openssl", args, {
++      cwd: path,
++      stdio: "pipe",
++    });
++  const selfSigned = (name: string, subject: string, ...extensions: string[]) =>
++    openssl(
++      "req",
++      "-x509",
++      "-newkey",
++      "ec",
++      "-pkeyopt",
++      "ec_paramgen_curve:P-256",
++      "-nodes",
++      "-days",
++      "1",
++      "-subj",
++      subject,
++      "-keyout",
++      `${name}-key.pem`,
++      "-out",
++      `${name}-cert.pem`,
++      ...extensions.flatMap((value) => ["-addext", value]),
++    );
++  selfSigned("host", "/CN=t3-connect-e2ee", "extendedKeyUsage=serverAuth");
++  selfSigned("edge", "/CN=localhost", "subjectAltName=IP:127.0.0.1");
++  selfSigned("ca", "/CN=test-client-ca", "basicConstraints=critical,CA:TRUE");
++  selfSigned("untrusted", "/CN=untrusted-client", "extendedKeyUsage=clientAuth");
++  openssl(
++    "req",
++    "-new",
++    "-newkey",
++    "ec",
++    "-pkeyopt",
++    "ec_paramgen_curve:P-256",
++    "-nodes",
++    "-subj",
++    "/CN=paired-client",
++    "-keyout",
++    "client-key.pem",
++    "-out",
++    "client.csr",
++  );
++  await writeFile(join(path, "client.ext"), "extendedKeyUsage=clientAuth\n");
++  openssl(
++    "x509",
++    "-req",
++    "-in",
++    "client.csr",
++    "-CA",
++    "ca-cert.pem",
++    "-CAkey",
++    "ca-key.pem",
++    "-set_serial",
++    "1",
++    "-days",
++    "1",
++    "-extfile",
++    "client.ext",
++    "-out",
++    "client-cert.pem",
++  );
++  await copyFile(join(path, "ca-cert.pem"), join(path, "client-ca.pem"));
++
++  const edgeCert = await readFile(join(path, "edge-cert.pem"));
++  setDefaultCACertificates([...trusted, edgeCert.toString("utf8")]);
++
++  const marker = "fixture-only-private-T3-payload";
++  const payload = marker.repeat(24000);
++  let backendRequests = 0;
++  const backend = createHttpServer((request, reply) => {
++    backendRequests++;
++    reply.end(request.url === "/.well-known/t3/environment" ? "public descriptor" : payload);
++  });
++  const appSockets = new WebSocketServer({ server: backend, path: "/ws" });
++  appSockets.on("connection", (socket) => socket.send(marker));
++  const backendPort = await listen(backend);
++  cleanup.defer(() => {
++    for (const socket of appSockets.clients) socket.terminate();
++    appSockets.close();
++    backend.closeAllConnections();
++    backend.close();
++  });
++
++  const managed = await startIngress({
++    directory: path,
++    port: 0,
++    backendOrigin: `http://127.0.0.1:${backendPort}`,
++  });
++  cleanup.defer(managed.close);
++  const publicOrigin = `http://127.0.0.1:${managed.port}`;
++  expect(await (await fetch(`${publicOrigin}/.well-known/t3/environment`)).text()).toBe(
++    "public descriptor",
++  );
++  expect(
++    (await fetch(`${publicOrigin}/api/t3-connect/health`, { method: "POST", body: "{}" })).status,
++  ).toBe(200);
++  for (const [method, route] of [
++    ["GET", "/"],
++    ["GET", "/ws"],
++    ["POST", "/oauth/token"],
++    ["POST", "/api/t3-connect/mint-credential"],
++  ] as const) {
++    expect((await fetch(`${publicOrigin}${route}`, { method })).status).toBe(404);
++  }
++  expect(backendRequests).toBe(2);
++
++  const edge = createHttpsServer({
++    cert: edgeCert,
++    key: await readFile(join(path, "edge-key.pem")),
++  });
++  const edgeSockets = new WebSocketServer({ server: edge });
++  const frames: Buffer[] = [];
++  edgeSockets.on("connection", (client, request) => {
++    const upstream = new WebSocket(`ws://127.0.0.1:${managed.port}${request.url}`);
++    client.on("message", (data: Buffer) => frames.push(data));
++    upstream.on("message", (data: Buffer) => frames.push(data));
++    const toHost = createWebSocketStream(upstream);
++    const toClient = createWebSocketStream(client);
++    toClient.on("error", () => toHost.destroy());
++    toHost.on("error", () => toClient.destroy());
++    toClient.pipe(toHost);
++    toHost.pipe(toClient);
++  });
++  const edgePort = await listen(edge);
++  cleanup.defer(() => {
++    for (const socket of edgeSockets.clients) socket.terminate();
++    edgeSockets.close();
++    edge.close();
++  });
++
++  const clientOptions = { endpoint: `https://127.0.0.1:${edgePort}`, directory: path, port: 0 };
++  await expect(startClient({ ...clientOptions, endpoint: publicOrigin })).rejects.toThrow("HTTPS");
++  const client = await startClient(clientOptions);
++  cleanup.defer(client.close);
++  expect(await (await fetch(`http://127.0.0.1:${client.port}/private`)).text()).toBe(payload);
++  const socket = new WebSocket(`ws://127.0.0.1:${client.port}/ws`);
++  const [message] = await once(socket, "message");
++  expect(message.toString()).toBe(marker);
++  socket.close();
++  expect(Buffer.concat(frames).includes(marker)).toBe(false);
++
++  const missDirectory = join(path, "wrong-host");
++  await mkdir(missDirectory);
++  await Promise.all([
++    copyFile(join(path, "client-key.pem"), join(missDirectory, "client-key.pem")),
++    copyFile(join(path, "client-cert.pem"), join(missDirectory, "client-cert.pem")),
++    copyFile(join(path, "edge-cert.pem"), join(missDirectory, "host-cert.pem")),
++  ]);
++  const wrongPin = await startClient({ ...clientOptions, directory: missDirectory });
++  cleanup.defer(wrongPin.close);
++  const fetchPrivate = ({ port }: { port: number }) =>
++    fetch(`http://127.0.0.1:${port}/private`, {
++      signal: AbortSignal.timeout(2000),
++    });
++  await expect(fetchPrivate(wrongPin)).rejects.toThrow();
++
++  await Promise.all([
++    copyFile(join(path, "untrusted-key.pem"), join(missDirectory, "client-key.pem")),
++    copyFile(join(path, "untrusted-cert.pem"), join(missDirectory, "client-cert.pem")),
++    copyFile(join(path, "host-cert.pem"), join(missDirectory, "host-cert.pem")),
++  ]);
++  const untrusted = await startClient({ ...clientOptions, directory: missDirectory });
++  cleanup.defer(untrusted.close);
++  await expect(fetchPrivate(untrusted)).rejects.toThrow();
++  expect(backendRequests).toBe(3);
++});
+diff --git a/apps/server/src/cloud/connectE2ee.ts b/apps/server/src/cloud/connectE2ee.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..913f3247beb3a83f540c210558d1381da7ed23ff
+--- /dev/null
++++ b/apps/server/src/cloud/connectE2ee.ts
+@@ -0,0 +1,248 @@
++// The Node TLS stack authenticates peers over a WebSocket byte stream.
++// @effect-diagnostics nodeBuiltinImport:off
++import { X509Certificate } from "node:crypto";
++import { readFile } from "node:fs/promises";
++import { createServer as createHttpServer, type IncomingMessage } from "node:http";
++import { connect as connectTcp, createServer as createTcpServer, type Server } from "node:net";
++import { join } from "node:path";
++import type { Duplex } from "node:stream";
++import { pipeline } from "node:stream/promises";
++import { connect as connectTls, createServer as createTlsServer, type TLSSocket } from "node:tls";
++import { createWebSocketStream, WebSocket, WebSocketServer } from "ws";
++
++const LOOPBACK = "127.0.0.1";
++const TLS_NAME = "t3-connect-e2ee";
++const TUNNEL_PATH = "/api/t3-connect/e2ee";
++const DESCRIPTOR_PATH = "/.well-known/t3/environment";
++const HEALTH_PATH = "/api/t3-connect/health";
++const HANDSHAKE_TIMEOUT = 10_000;
++const MAX_CONNECTIONS = 128;
++const MAX_CONTROL_BYTES = 32 * 1024;
++const WS_OPTIONS = { perMessageDeflate: false, maxPayload: 256 * 1024 };
++
++export function hostConfig() {
++  const portValue = process.env.T3CODE_CONNECT_E2EE_PORT;
++  const directory = process.env.T3CODE_CONNECT_E2EE_CERT_DIR;
++  if (portValue === undefined && directory === undefined) return null;
++  const port = Number(portValue);
++  if (!portValue || !/^\d+$/u.test(portValue) || port < 1 || port > 65_535 || !directory) {
++    throw new Error(
++      "Set T3CODE_CONNECT_E2EE_PORT to a valid port and T3CODE_CONNECT_E2EE_CERT_DIR to the host certificate directory.",
++    );
++  }
++  return { port, directory, origin: `http://${LOOPBACK}:${port}` };
++}
++
++function listen(server: Server, port: number): Promise<void> {
++  return new Promise((resolve, reject) => {
++    server.once("error", reject);
++    server.listen(port, LOOPBACK, () => {
++      server.off("error", reject);
++      resolve();
++    });
++  });
++}
++
++async function readCredentials(directory: string, role: "host" | "client") {
++  const [key, cert, ca] = await Promise.all([
++    readFile(join(directory, `${role}-key.pem`)),
++    readFile(join(directory, `${role}-cert.pem`)),
++    readFile(join(directory, role === "host" ? "client-ca.pem" : "host-cert.pem")),
++  ]);
++  return {
++    key,
++    cert,
++    ca,
++    minVersion: "TLSv1.3" as const,
++    rejectUnauthorized: true,
++  };
++}
++
++async function bridge(left: Duplex, right: Duplex) {
++  await Promise.allSettled([pipeline(left, right), pipeline(right, left)]);
++}
++
++function tunnelStream(socket: WebSocket) {
++  socket.on("message", (_data, binary) => {
++    if (!binary) socket.terminate();
++  });
++  return createWebSocketStream(socket);
++}
++
++async function controlRequest(request: IncomingMessage, backend: URL) {
++  const method = request.method;
++  const path = request.url;
++  const isHealth = method === "POST" && path === HEALTH_PATH;
++  if (!isHealth && !(method === "GET" && path === DESCRIPTOR_PATH)) {
++    return new Response(null, { status: 404 });
++  }
++  let body: string | undefined;
++  if (isHealth) {
++    const chunks: Buffer[] = [];
++    let size = 0;
++    for await (const chunk of request) {
++      size += chunk.length;
++      if (size > MAX_CONTROL_BYTES) return new Response(null, { status: 413 });
++      chunks.push(chunk);
++    }
++    body = Buffer.concat(chunks).toString("utf8");
++  }
++  // @effect-diagnostics-next-line globalFetch:off -- This adapter is called by Node HTTP, outside an Effect runtime.
++  return fetch(new URL(path!, backend), {
++    method,
++    ...(body === undefined ? {} : { body, headers: { "content-type": "application/json" } }),
++    redirect: "error",
++    signal: AbortSignal.timeout(HANDSHAKE_TIMEOUT),
++  });
++}
++
++export async function startIngress(options: {
++  directory: string;
++  port: number;
++  backendOrigin: string;
++}) {
++  const backend = new URL(options.backendOrigin);
++  const backendPort = Number(backend.port || 80);
++  const backendHost = backend.hostname.replace(/^\[(.*)\]$/u, "$1");
++  if (backend.protocol !== "http:" || ![LOOPBACK, "::1"].includes(backendHost)) {
++    throw new Error("The T3 Connect E2EE backend must be a loopback HTTP origin.");
++  }
++  const credentials = await readCredentials(options.directory, "host");
++  const tls = createTlsServer(
++    { ...credentials, requestCert: true, handshakeTimeout: HANDSHAKE_TIMEOUT },
++    (socket) => {
++      const target = connectTcp(backendPort, backendHost);
++      void bridge(socket, target);
++    },
++  );
++  const websockets = new WebSocketServer({ ...WS_OPTIONS, noServer: true });
++  const ingress = createHttpServer(
++    {
++      headersTimeout: HANDSHAKE_TIMEOUT,
++      requestTimeout: HANDSHAKE_TIMEOUT,
++      connectionsCheckingInterval: 1000,
++    },
++    (request, reply) => {
++      reply.setHeader("cache-control", "no-store");
++      void controlRequest(request, backend)
++        .then(async (response) => {
++          const contents = Buffer.from(await response.arrayBuffer());
++          reply.statusCode = response.status;
++          const contentType = response.headers.get("content-type");
++          if (contentType) reply.setHeader("content-type", contentType);
++          reply.end(contents);
++        })
++        .catch(() => {
++          reply.statusCode = 502;
++          reply.end();
++        });
++    },
++  );
++  ingress.maxConnections = MAX_CONNECTIONS;
++  ingress.on("upgrade", (request, socket, head) => {
++    if (request.url !== TUNNEL_PATH || websockets.clients.size >= MAX_CONNECTIONS) {
++      socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
++      return;
++    }
++    websockets.handleUpgrade(request, socket, head, (websocket) => {
++      const stream = tunnelStream(websocket);
++      stream.on("error", () => websocket.terminate());
++      tls.emit("connection", stream);
++    });
++  });
++  await listen(ingress, options.port);
++  return {
++    port: (ingress.address() as { port: number }).port,
++    close: () =>
++      new Promise<void>((resolve) => {
++        ingress.close(() => resolve());
++        for (const websocket of websockets.clients) websocket.terminate();
++        ingress.closeAllConnections();
++      }),
++  };
++}
++
++function connectInner(
++  endpoint: URL,
++  credentials: Awaited<ReturnType<typeof readCredentials>>,
++  fingerprint: string,
++) {
++  const websocket = new WebSocket(endpoint, {
++    ...WS_OPTIONS,
++    followRedirects: false,
++    handshakeTimeout: HANDSHAKE_TIMEOUT,
++    rejectUnauthorized: true,
++  });
++  const stream = tunnelStream(websocket);
++  const socket = connectTls({
++    ...credentials,
++    socket: stream,
++    servername: TLS_NAME,
++    allowPartialTrustChain: true,
++    checkServerIdentity: (_name, cert) =>
++      cert.fingerprint256 === fingerprint
++        ? undefined
++        : new Error("T3 Connect host certificate did not match the pinned certificate."),
++  });
++  return new Promise<TLSSocket>((resolve, reject) => {
++    const deadline = AbortSignal.timeout(HANDSHAKE_TIMEOUT);
++    const onTimeout = () => socket.destroy(new Error("T3 Connect E2EE handshake timed out."));
++    deadline.addEventListener("abort", onTimeout, { once: true });
++    const clearDeadline = () => deadline.removeEventListener("abort", onTimeout);
++    socket.once("secureConnect", () => {
++      clearDeadline();
++      resolve(socket);
++    });
++    socket.on("error", (error) => {
++      clearDeadline();
++      reject(error);
++      websocket.terminate();
++    });
++    socket.once("close", () => {
++      clearDeadline();
++      reject(new Error("T3 Connect E2EE connection closed during the handshake."));
++      websocket.terminate();
++    });
++  });
++}
++
++export async function startClient(options: { endpoint: string; directory: string; port: number }) {
++  const endpoint = new URL(options.endpoint);
++  if (
++    endpoint.protocol !== "https:" ||
++    endpoint.username ||
++    endpoint.password ||
++    endpoint.pathname !== "/" ||
++    endpoint.search ||
++    endpoint.hash
++  ) {
++    throw new Error("Use the HTTPS origin of the T3 Connect tunnel.");
++  }
++  endpoint.protocol = "wss:";
++  endpoint.pathname = TUNNEL_PATH;
++  const credentials = await readCredentials(options.directory, "client");
++  const fingerprint = new X509Certificate(credentials.ca).fingerprint256;
++  const peers = new Set<Duplex>();
++  const server = createTcpServer({ pauseOnConnect: true }, (client) => {
++    peers.add(client);
++    client.once("close", () => peers.delete(client));
++    client.on("error", () => client.destroy());
++    void connectInner(endpoint, credentials, fingerprint).then(
++      (socket) => {
++        if (client.destroyed) socket.destroy();
++        else void bridge(client, socket);
++      },
++      () => client.destroy(),
++    );
++  });
++  server.maxConnections = MAX_CONNECTIONS;
++  await listen(server, options.port);
++  return {
++    port: (server.address() as { port: number }).port,
++    close: () =>
++      new Promise<void>((resolve) => {
++        server.close(() => resolve());
++        for (const peer of peers) peer.destroy();
++      }),
++  };
++}
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 916cca3109bc1b64221181aee35f5308c009fe87..d888ef496aa9d55962c7bce77907f7ab06e5a4ef 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -3,6 +3,7 @@ import * as DatabaseMigrationProgress from "./persistence/DatabaseMigrationProgr
+ import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
+ import * as Random from "effect/Random";
+ import * as EnvironmentKeys from "./cloud/environmentKeys.ts";
++import * as ConnectE2ee from "./cloud/connectE2ee.ts";
+ import * as AssetSigner from "./assets/AssetSigner.ts";
+ import * as WorkspacePreviewRevisions from "./assets/WorkspacePreviewRevisions.ts";
+ import * as DatabaseStorage from "./persistence/DatabaseStorage.ts";
+@@ -1208,6 +1209,20 @@ const layerMakeServer = Layer.unwrap(
+           yield* Deferred.succeed(cloudLinkParked, undefined).pipe(Effect.orDie);
+           return;
+         }
++        const address = (yield* HttpServer.HttpServer).address;
++        if (typeof address === "string" || !("port" in address)) {
++          yield* Deferred.succeed(cloudLinkParked, undefined).pipe(Effect.orDie);
++          return;
++        }
++        const backendOrigin = `http://${loopbackUrlHostForAddress(address)}:${address.port}`;
++        const privateConnect = ConnectE2ee.hostConfig();
++        if (privateConnect) {
++          yield* Effect.acquireRelease(
++            Effect.promise(() => ConnectE2ee.startIngress({ ...privateConnect, backendOrigin })),
++            (ingress) => Effect.promise(ingress.close),
++          );
++        }
++        const localOrigin = privateConnect?.origin ?? backendOrigin;
+         const releaseManagedTunnel = cloudLink.releaseManagedTunnelOnShutdown().pipe(
+           Effect.timeout("10 seconds"),
+           Effect.tap((released) =>
+@@ -1232,10 +1247,6 @@ const layerMakeServer = Layer.unwrap(
+             if (!cleanupBeforeActivation) {
+               yield* Effect.addFinalizer(() => releaseManagedTunnel);
+             }
+-            const server = yield* HttpServer.HttpServer;
+-            const address = server.address;
+-            if (typeof address === "string" || !("port" in address)) return;
+-            const localOrigin = `http://${loopbackUrlHostForAddress(address)}:${address.port}`;
+             const endpointRuntime = yield* CloudManagedEndpointRuntime.CloudManagedEndpointRuntime;
+             const runManagedTunnelRecovery = yield* makeManagedTunnelRecovery({
+               recover: (config: RelayManagedEndpointRuntimeConfig) =>
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 5f1afcad90b3e1b959347b3788fb7136e4fce639..1125fe285e399b96c6875d3373ab1df69d71f73b 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -977,6 +977,9 @@ importers:
+       undici:
+         specifier: 'catalog:'
+         version: 8.12.4
++      ws:
++        specifier: 'catalog:'
++        version: 8.22.0(bufferutil@4.1.0)(utf-8-validate@6.0.6)
+       yaml:
+         specifier: ^2.9.0
+         version: 2.9.0
+@@ -1035,6 +1038,9 @@ importers:
+       '@types/proper-lockfile':
+         specifier: ^4.1.4
+         version: 4.1.4
++      '@types/ws':
++        specifier: 'catalog:'
++        version: 8.18.2
+       '@types/yauzl':
+         specifier: ^3.4.0
+         version: 3.4.0
