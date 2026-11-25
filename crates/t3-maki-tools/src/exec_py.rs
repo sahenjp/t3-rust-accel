@@ -22,6 +22,7 @@ use crate::{emit, fail};
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const MAX_TIMEOUT_MS: u64 = 30_000;
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(not(target_os = "macos"))]
 const PROCESS_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 #[cfg(unix)]
 const RLIMIT_CPU_SECS: u64 = 15;
@@ -238,6 +239,9 @@ fn configure_platform_child(cmd: &mut Command) {
                     Err(std::io::Error::last_os_error())
                 }
             };
+            // Darwin rejects this limit when the child's existing address map
+            // already exceeds it, before Python can start.
+            #[cfg(not(target_os = "macos"))]
             set_limit(libc::RLIMIT_AS, PROCESS_MEMORY_BYTES as _)?;
             set_limit(libc::RLIMIT_CPU, RLIMIT_CPU_SECS as _)?;
             set_limit(libc::RLIMIT_FSIZE, RLIMIT_FSIZE_BYTES as _)?;
