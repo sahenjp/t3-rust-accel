@@ -1,12 +1,14 @@
 //! `diff --cwd <abs>` — compact `git diff` with lockfile/generated exclusions,
 //! a shortstat + name-status header, and `-U2` hunks for token savings.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde_json::json;
 
+use crate::process::resolve_executable;
 use crate::text::head_tail_bytes;
 use crate::{emit, fail};
 
@@ -31,14 +33,38 @@ fn generated_set() -> GlobSet {
     b.build().unwrap()
 }
 
+fn git_bin() -> Result<PathBuf, String> {
+    static GIT_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    GIT_BIN
+        .get_or_init(|| resolve_executable("git"))
+        .clone()
+        .ok_or_else(|| "cannot find git on PATH".to_string())
+}
+
+fn valid_rev(rev: &str) -> bool {
+    // A revision/range is passed before `--`; never allow it to become another
+    // git option. Whitespace remains safe because exec arguments are not
+    // shell-split and is valid in forms such as `HEAD@{2 days ago}`.
+    !rev.is_empty() && !rev.starts_with('-')
+}
+
 fn git(cwd: &str, diff_args: &[&str], pathspec: &[String]) -> Result<String, String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(cwd).arg("diff");
+    let bin = git_bin()?;
+    let mut cmd = Command::new(bin);
+    cmd.env("LC_ALL", "C");
+    cmd.args([
+        "--no-pager",
+        "-c",
+        "core.quotePath=false",
+        "-C",
+        cwd,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+    ]);
     cmd.args(diff_args);
     cmd.args(pathspec);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("cannot run git: {e}"))?;
+    let out = cmd.output().map_err(|e| format!("cannot run git: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
@@ -56,7 +82,6 @@ fn parse_shortstat(stat: &str) -> (u64, u64, u64) {
     let mut del = 0u64;
     for part in stat.split(',') {
         let n: u64 = part
-            .trim()
             .split_whitespace()
             .next()
             .and_then(|t| t.parse().ok())
@@ -89,6 +114,13 @@ pub fn cmd_diff(cwd: &str, rev: Option<&str>, path: Option<&str>, max_bytes: usi
         }
     }
 
+    if let Some(r) = rev {
+        if !valid_rev(r) {
+            fail(format!(
+                "invalid --rev '{r}': expected a single revision or range, not an option"
+            ));
+        }
+    }
     let rev_args: Vec<&str> = rev.into_iter().collect();
 
     // Stats + name-status header (with exclusions applied).
@@ -137,18 +169,19 @@ pub fn cmd_diff(cwd: &str, rev: Option<&str>, path: Option<&str>, max_bytes: usi
         diff_out.push('\n');
     }
     if skipped_generated > 0 {
-        diff_out.push_str(&format!("{skipped_generated} generated/lock files skipped\n"));
+        diff_out.push_str(&format!(
+            "{skipped_generated} generated/lock files skipped\n"
+        ));
     }
-    let mut shown_files = 0usize;
-    for line in name_status.lines() {
+    let total_status_files = name_status.lines().count();
+    for (shown_files, line) in name_status.lines().enumerate() {
         if shown_files >= MAX_HEADER_FILES {
-            let rest = name_status.lines().count() - shown_files;
+            let rest = total_status_files - shown_files;
             diff_out.push_str(&format!("[... {rest} more files]\n"));
             break;
         }
         let (status, file) = line.split_once('\t').unwrap_or((line, ""));
         diff_out.push_str(&format!("{status} {file}\n"));
-        shown_files += 1;
     }
     if !diff_out.is_empty() && !body.is_empty() {
         diff_out.push('\n');

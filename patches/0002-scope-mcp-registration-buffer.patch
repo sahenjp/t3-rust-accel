@@ -1,0 +1,93 @@
+diff --git a/apps/server/src/mcp/McpHttpServer.ts b/apps/server/src/mcp/McpHttpServer.ts
+index eb05f2c375..f110a86407 100644
+--- a/apps/server/src/mcp/McpHttpServer.ts
++++ b/apps/server/src/mcp/McpHttpServer.ts
+@@ -1495,39 +1495,39 @@ const withResultPruning = <A, E, R>(
+     });
+   });
+ 
+-// Buffer for sorted tool registration; set only while `layer` builds (single-threaded build).
+ type AddToolOptions = Parameters<McpServer.McpServer["Service"]["addTool"]>[0];
+-let pendingToolRegistrations: Array<AddToolOptions> | undefined;
++const ToolRegistrationBuffer = Context.Reference<Array<AddToolOptions> | undefined>(
++  "t3/mcp/ToolRegistrationBuffer",
++  { defaultValue: () => undefined },
++);
+ 
+-/** Deflects `addTool` into `pendingToolRegistrations` so `layer` can replay them name-sorted. */
+-const withRegistrationBuffer = <A, E, R>(
+-  registration: Effect.Effect<A, E, R>,
+-): Effect.Effect<A, E, R | McpServer.McpServer> =>
+-  Effect.suspend((): Effect.Effect<A, E, R | McpServer.McpServer> => {
+-    const buffer = pendingToolRegistrations;
+-    if (buffer === undefined) return registration;
+-    return Effect.gen(function* () {
+-      const server = yield* McpServer.McpServer;
+-      const bufferedServer = McpServer.McpServer.of({
+-        ...server,
+-        get tools() {
+-          return [
+-            ...server.tools,
+-            ...buffer.map((options) => ({
+-              tool: options.tool,
+-              annotations: options.annotations,
+-            })),
+-          ];
+-        },
+-        addTool: Effect.fnUntraced((options: AddToolOptions) =>
+-          Effect.sync(() => {
+-            buffer.push(options);
+-          }),
+-        ),
+-      });
+-      return yield* registration.pipe(Effect.provideService(McpServer.McpServer, bufferedServer));
+-    });
++/** Collects the current layer's registrations before replaying them in name order. */
++const withRegistrationBuffer = Effect.fn("McpHttpServer.withRegistrationBuffer")(function* <
++  A,
++  E,
++  R,
++>(registration: Effect.Effect<A, E, R>) {
++  const buffer = yield* ToolRegistrationBuffer;
++  if (buffer === undefined) return yield* registration;
++  const server = yield* McpServer.McpServer;
++  const bufferedServer = McpServer.McpServer.of({
++    ...server,
++    get tools() {
++      return [
++        ...server.tools,
++        ...buffer.map((options) => ({
++          tool: options.tool,
++          annotations: options.annotations,
++        })),
++      ];
++    },
++    addTool: (options) =>
++      Effect.sync(() => {
++        buffer.push(options);
++      }),
+   });
++  return yield* registration.pipe(Effect.provideService(McpServer.McpServer, bufferedServer));
++});
+ 
+ /**
+  * Tools declare their handler services as request-level dependencies. Those
+@@ -1958,13 +1958,12 @@ const layerAllRegistrations = Layer.unwrap(
+   Effect.gen(function* () {
+     if (!mcpDeferTools() && !mcpStaticToolList()) return layerRegistrations;
+     const buffer: Array<AddToolOptions> = [];
+-    pendingToolRegistrations = buffer;
+-    const built = yield* Layer.build(layerRegistrations).pipe(Effect.exit);
+-    pendingToolRegistrations = undefined;
+-    if (built._tag === "Failure") return yield* Effect.failCause(built.cause);
++    yield* Layer.build(layerRegistrations).pipe(
++      Effect.provideService(ToolRegistrationBuffer, buffer),
++    );
+     const server = yield* McpServer.McpServer;
+-    const sorted = [...buffer].sort((a, b) => (a.tool.name < b.tool.name ? -1 : 1));
+-    for (const options of sorted) yield* server.addTool(options);
++    buffer.sort((a, b) => (a.tool.name < b.tool.name ? -1 : a.tool.name > b.tool.name ? 1 : 0));
++    for (const options of buffer) yield* server.addTool(options);
+     return Layer.empty;
+   }),
+ );

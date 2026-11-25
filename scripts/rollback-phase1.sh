@@ -3,7 +3,7 @@
 # only; it never runs daemon-reload or restarts the service.
 set -euo pipefail
 
-DST_DIR="${HOME}/.config/systemd/user/t3code.service.d"
+DST_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/t3code.service.d"
 DST="${DST_DIR}/memory-tuning.conf"
 
 if [[ ! -f "$DST" ]]; then
@@ -13,12 +13,6 @@ fi
 
 rm -f "$DST"
 echo "removed $DST"
-
-# Clean up the drop-in directory only if it is now empty.
-if [[ -d "$DST_DIR" ]] && [[ -z "$(ls -A "$DST_DIR")" ]]; then
-    rmdir "$DST_DIR"
-    echo "removed empty $DST_DIR"
-fi
 
 cat <<'EOF'
 

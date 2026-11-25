@@ -1,12 +1,13 @@
 // RSS benchmark: 6 V8 worker isolates (node:sqlite) vs Rust OS threads (t3-native-sqlite)
-import { readFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 
-import { NativeCheckpointWorker, NativeSqliteWorker } from "./index.mjs";
+import { sqliteModuleUrl } from "../../scripts/t3-accel.mjs";
+
+const { NativeCheckpointWorker, NativeSqliteWorker } = await import(sqliteModuleUrl);
 
 const dir = mkdtempSync(join(tmpdir(), "t3-sqlite-bench-"));
 const dbFile = join(dir, "state.sqlite");
@@ -16,8 +17,7 @@ const dbFile = join(dir, "state.sqlite");
   db.close();
 }
 
-const vmRss = () =>
-  Number(readFileSync("/proc/self/status", "utf8").match(/VmRSS:\s*(\d+) kB/)[1]) * 1024;
+const vmRss = process.memoryUsage.rss;
 const fmt = (b) => `${(b / 1024 / 1024).toFixed(1)} MB`;
 const settle = () => new Promise((r) => setTimeout(r, 150));
 if (global.gc) global.gc();

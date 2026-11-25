@@ -1,0 +1,137 @@
+name: Verify and package Rust acceleration
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: t3-rust-accel-linux-x64
+          - runner: ubuntu-24.04-arm
+            artifact: t3-rust-accel-linux-arm64
+          - runner: macos-15
+            artifact: t3-rust-accel-darwin-arm64
+          - runner: macos-15-intel
+            artifact: t3-rust-accel-darwin-x64
+          - runner: windows-2025
+            artifact: t3-rust-accel-win32-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: matrix.artifact == 't3-rust-accel-linux-x64'
+        with:
+          repository: pingdotgg/t3code
+          ref: 4e6b1fa7710515cee652370b534e041a372648ea
+          path: upstream
+          persist-credentials: false
+      - name: Check the T3 Code patch stack against upstream
+        if: matrix.artifact == 't3-rust-accel-linux-x64'
+        shell: bash
+        run: |
+          for patch in patches/000*.patch; do
+            git -C upstream apply --whitespace=error-all "$PWD/$patch"
+          done
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: runner.os != 'Linux'
+        with:
+          node-version: 26.13.1
+      - name: Build and test on Debian 12
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker build --tag t3-accel-build - < scripts/debian-build.Dockerfile
+          docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges \
+            --env HOME=/tmp --env CARGO_HOME=/tmp/cargo \
+            --mount "type=bind,src=$PWD,target=/src" --workdir /src \
+            t3-accel-build bash scripts/verify-package.sh
+      - name: Build and test native Windows and macOS packages
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          rustup default 1.100.0
+          bash scripts/verify-package.sh
+      - name: Boot the packaged tools on Debian 12 and 13 without network access
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/test-linux-package.sh dist
+      - name: Check the artifact matches the runner matrix
+        shell: bash
+        run: test -f "dist/${{ matrix.artifact }}.tar.gz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name == 'push'
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    concurrency:
+      group: release-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: t3-rust-accel-*
+          path: packages
+      - name: Verify packages and write one release checksum manifest
+        shell: bash
+        run: |
+          mkdir release
+          for platform in linux-x64 linux-arm64 darwin-arm64 darwin-x64 win32-x64; do
+            name="t3-rust-accel-$platform"
+            archive="$name.tar.gz"
+            manifest="packages/$name/SHA256SUMS"
+            grep -xE "[0-9a-f]{64}  $name[.]tar[.]gz" "$manifest" > "release/$archive.sha256"
+            cmp "$manifest" "release/$archive.sha256"
+            (cd "packages/$name" && sha256sum --strict --check SHA256SUMS)
+            mv "packages/$name/$archive" release/
+            cat "release/$archive.sha256" >> release/SHA256SUMS
+            rm "release/$archive.sha256"
+          done
+      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release/*
+      - name: Publish verified assets from a draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Use a version tag such as v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+          release_options=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then release_options+=(--prerelease); fi
+          draft="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "$draft" == false ]]; then
+            echo "::error::This version has already been published"
+            exit 1
+          fi
+          if [[ "$draft" != true ]]; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --generate-notes --title "$GITHUB_REF_NAME" "${release_options[@]}"
+          fi
+          gh release upload "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

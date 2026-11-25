@@ -4,8 +4,9 @@ use std::process::exit;
 use t3_maki_tools::{diff, econ, exec_py, grep, prune, skeleton, slice};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_STDIN_BYTES: u64 = 16 * 1024 * 1024;
 
-const USAGE: &str = "t3-maki-tools — Maki-grade tree-sitter index/slice, AST grep, compact git diff, sandboxed exec, dsh econ/prune
+const USAGE: &str = "t3-maki-tools — Maki-grade tree-sitter index/slice, AST grep, compact git diff, resource-limited exec, dsh econ/prune
 
 Usage: t3-maki-tools <command> [options]
 
@@ -22,8 +23,8 @@ Commands:
         Compact git diff: shortstat + name-status header, -U2 hunks,
         generated/lock files excluded and counted as skippedGenerated.
   exec --cwd <abs> [--timeout-ms <n>] [--max-bytes <n>]
-        Run a Python 3 script from stdin inside --cwd (rlimits + SIGKILL
-        timeout + head/tail truncation). Helpers: index, slice_code, read,
+        Run a trusted Python 3 script from stdin in --cwd with process limits,
+        timeout and output truncation. Helpers: index, slice_code, read,
         grep, glob_files.
   econ
         Read compaction CostInput+Prices JSON from stdin; emit break-even
@@ -53,13 +54,15 @@ fn parse_args(argv: &[String]) -> Args {
     let mut i = 0;
     while i < argv.len() {
         let arg = &argv[i];
-        if arg.starts_with("--") {
-            let key = arg[2..].to_string();
-            if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
-                a.flags.insert(key, argv[i + 1].clone());
+        if let Some(flag) = arg.strip_prefix("--") {
+            if let Some((key, value)) = flag.split_once('=') {
+                a.flags.insert(key.to_string(), value.to_string());
+                i += 1;
+            } else if i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
+                a.flags.insert(flag.to_string(), argv[i + 1].clone());
                 i += 2;
             } else {
-                a.bools.insert(key);
+                a.bools.insert(flag.to_string());
                 i += 1;
             }
         } else {
@@ -96,7 +99,16 @@ impl Args {
 
 fn read_stdin() -> Vec<u8> {
     let mut buf = Vec::new();
-    let _ = std::io::stdin().read_to_end(&mut buf);
+    let mut limited = std::io::stdin().take(MAX_STDIN_BYTES + 1);
+    if let Err(e) = limited.read_to_end(&mut buf) {
+        t3_maki_tools::fail(format!("cannot read stdin: {e}"));
+    }
+    if buf.len() as u64 > MAX_STDIN_BYTES {
+        t3_maki_tools::fail(format!(
+            "stdin exceeds the {} MiB input limit",
+            MAX_STDIN_BYTES / (1024 * 1024)
+        ));
+    }
     buf
 }
 

@@ -1,12 +1,14 @@
 //! `index --path <dir>` — .gitignore-aware compact tree with line/symbol counts.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use ignore::WalkBuilder;
 use serde_json::json;
 
-use crate::skeleton::{build_skeleton, Lang, MAX_FILE_BYTES};
+use crate::skeleton::{count_symbols, Lang, MAX_FILE_BYTES};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -22,39 +24,44 @@ enum Tree {
     File { lines: Option<usize>, syms: usize },
 }
 
-fn count_lines(bytes: &[u8]) -> usize {
-    if bytes.is_empty() {
-        return 0;
-    }
-    let n = bytes.iter().filter(|&&b| b == b'\n').count();
-    if bytes.last() == Some(&b'\n') {
-        n
-    } else {
-        n + 1
-    }
-}
-
-fn is_binary(bytes: &[u8]) -> bool {
-    bytes[..bytes.len().min(8192)].contains(&0)
-}
-
 fn file_stats(path: &Path) -> (Option<usize>, usize) {
-    let Ok(bytes) = std::fs::read(path) else {
-        return (None, 0);
-    };
-    if is_binary(&bytes) {
-        return (None, 0);
+    read_stats(path).unwrap_or((None, 0))
+}
+
+fn read_stats(path: &Path) -> std::io::Result<(Option<usize>, usize)> {
+    let mut reader = BufReader::new(File::open(path)?);
+    if reader.fill_buf()?.contains(&0) {
+        return Ok((None, 0));
     }
-    let lines = count_lines(&bytes);
     let lang = Lang::from_path(path);
-    if !lang.is_tree_sitter() || bytes.len() as u64 > MAX_FILE_BYTES {
-        return (Some(lines), 0);
+    let mut source = lang.is_tree_sitter().then(Vec::new);
+    let mut lines = 0;
+    let mut last = None;
+    loop {
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() {
+            break;
+        }
+        lines += bytes.iter().filter(|&&byte| byte == b'\n').count();
+        last = bytes.last().copied();
+        if let Some(buffer) = &mut source {
+            if buffer.len() + bytes.len() <= MAX_FILE_BYTES as usize {
+                buffer.extend_from_slice(bytes);
+            } else {
+                source = None;
+            }
+        }
+        let len = bytes.len();
+        reader.consume(len);
     }
-    let Ok(src) = String::from_utf8(bytes) else {
-        return (Some(lines), 0);
-    };
-    let sk = build_skeleton(lang, &src, usize::MAX);
-    (Some(lines), sk.symbol_count)
+    let symbols = source
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map_or(0, |src| count_symbols(lang, src));
+    Ok((
+        Some(lines + usize::from(last.is_some_and(|byte| byte != b'\n'))),
+        symbols,
+    ))
 }
 
 fn render(map: &BTreeMap<String, Tree>, indent: usize, lines: &mut Vec<String>) {
@@ -116,13 +123,19 @@ pub fn index_dir(root: &Path, max_depth: usize, max_lines: usize) -> ! {
         if comps.is_empty() {
             continue;
         }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_dir = file_type.is_dir();
+        if !is_dir && !file_type.is_file() {
+            continue;
+        }
         let mut cur = &mut tree;
         for (i, comp) in comps.iter().enumerate() {
             let last = i + 1 == comps.len();
             let Tree::Dir(map) = cur else { break };
             if last && !is_dir {
-                let (lines, syms) = file_stats(&root.join(rel));
+                let (lines, syms) = file_stats(entry.path());
                 map.insert(comp.clone(), Tree::File { lines, syms });
                 break;
             }

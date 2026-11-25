@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -35,6 +35,9 @@ enum Part {
     Wait(std::sync::Arc<Notify>),
     Sleep(u64),
     SetFlag(std::sync::Arc<AtomicBool>),
+    /// Waits until the flag is set. Unlike `Wait`, late streams observe an
+    /// already-open gate, which avoids lost notifications in fan-in tests.
+    Gate(std::sync::Arc<AtomicBool>),
     /// Rendezvous point: stalls this stream until N peers also reach it.
     Sync(std::sync::Arc<tokio::sync::Barrier>),
 }
@@ -58,13 +61,18 @@ type Handler = Arc<dyn Fn(&RecordedRequest) -> Plan + Send + Sync>;
 struct TestServer {
     endpoint: String,
     requests: Arc<StdMutex<Vec<RecordedRequest>>>,
+    peak_connections: Arc<AtomicUsize>,
 }
 
 async fn start_server(handler: Handler) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
     let requests = Arc::new(StdMutex::new(Vec::new()));
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let peak_connections = Arc::new(AtomicUsize::new(0));
     let recorded = requests.clone();
+    let active = active_connections.clone();
+    let peak = peak_connections.clone();
     tokio::spawn(async move {
         loop {
             let Ok((socket, _)) = listener.accept().await else {
@@ -74,21 +82,40 @@ async fn start_server(handler: Handler) -> TestServer {
                 socket,
                 handler.clone(),
                 recorded.clone(),
+                active.clone(),
+                peak.clone(),
             ));
         }
     });
-    TestServer { endpoint, requests }
+    TestServer {
+        endpoint,
+        requests,
+        peak_connections,
+    }
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
+struct ActiveConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 async fn handle_conn(
     mut socket: tokio::net::TcpStream,
     handler: Handler,
     recorded: Arc<StdMutex<Vec<RecordedRequest>>>,
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 ) {
+    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+    peak.fetch_max(current, Ordering::SeqCst);
+    let _active_guard = ActiveConnectionGuard(active);
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 16384];
     loop {
@@ -127,8 +154,7 @@ async fn handle_conn(
                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
             }
         }
-        let body =
-            String::from_utf8_lossy(&buf[head_len..head_len + content_length]).into_owned();
+        let body = String::from_utf8_lossy(&buf[head_len..head_len + content_length]).into_owned();
         buf.drain(..head_len + content_length);
         let request = RecordedRequest {
             method,
@@ -188,6 +214,11 @@ async fn handle_conn(
                         Part::SetFlag(flag) => {
                             flag.store(true, Ordering::SeqCst);
                         }
+                        Part::Gate(flag) => {
+                            while !flag.load(Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                        }
                         Part::Sync(barrier) => {
                             barrier.wait().await;
                         }
@@ -208,10 +239,7 @@ fn stdout_of(out: &Mutex<Vec<u8>>) -> String {
 }
 
 fn out_lines(out: &Mutex<Vec<u8>>) -> Vec<String> {
-    stdout_of(out)
-        .lines()
-        .map(|l| l.to_string())
-        .collect()
+    stdout_of(out).lines().map(|l| l.to_string()).collect()
 }
 
 fn bridge_input(lines: &[&str]) -> Cursor<Vec<u8>> {
@@ -260,6 +288,75 @@ fn js_stringify_matches_json_stringify() {
     assert_eq!(js_stringify(&Value::Object(map)), "{\"z\":1,\"a\":2}");
 }
 
+#[test]
+fn sse_parser_handles_fragmented_crlf_separator() {
+    let mut parser = SseParser::default();
+    parser.push(b"data: {\"a\":1}\r");
+    assert_eq!(parser.next_event().unwrap(), None);
+    parser.push(b"\n\r");
+    assert_eq!(parser.next_event().unwrap(), None);
+    parser.push(b"\ndata: {\"b\":2}\n");
+    assert_eq!(
+        parser.next_event().unwrap().as_deref(),
+        Some("data: {\"a\":1}")
+    );
+    assert_eq!(parser.next_event().unwrap(), None);
+    parser.push(b"\n");
+    assert_eq!(
+        parser.next_event().unwrap().as_deref(),
+        Some("data: {\"b\":2}")
+    );
+}
+
+#[test]
+fn sse_parser_rescans_only_the_separator_overlap() {
+    let mut parser = SseParser::default();
+    parser.push(&vec![b'x'; 1024]);
+    assert_eq!(parser.next_event().unwrap(), None);
+    assert_eq!(parser.scan_pos, 1024 - SSE_SEPARATOR_OVERLAP);
+    parser.push(b"data");
+    assert_eq!(parser.next_event().unwrap(), None);
+    assert_eq!(parser.scan_pos, 1028 - SSE_SEPARATOR_OVERLAP);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_line_reader_discards_only_the_overlong_line() {
+    let overlong = "x".repeat(33);
+    let input = format!("{overlong}\n{{\"ok\":true}}\r\nexact-end");
+    let mut input = Cursor::new(input.into_bytes());
+    let mut raw = Vec::new();
+
+    assert_eq!(
+        read_line_bounded(&mut input, &mut raw, 32).await.unwrap(),
+        BoundedLine::TooLong
+    );
+    assert_eq!(
+        read_line_bounded(&mut input, &mut raw, 32).await.unwrap(),
+        BoundedLine::Line
+    );
+    assert_eq!(raw, b"{\"ok\":true}\r\n");
+    assert_eq!(
+        read_line_bounded(&mut input, &mut raw, 32).await.unwrap(),
+        BoundedLine::Line
+    );
+    assert_eq!(raw, b"exact-end");
+    assert_eq!(
+        read_line_bounded(&mut input, &mut raw, 32).await.unwrap(),
+        BoundedLine::Eof
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_line_reader_accepts_exact_limit() {
+    let mut input = Cursor::new(b"12345678901234567890123456789012\n".to_vec());
+    let mut raw = Vec::new();
+    assert_eq!(
+        read_line_bounded(&mut input, &mut raw, 32).await.unwrap(),
+        BoundedLine::Line
+    );
+    assert_eq!(raw.len(), 33);
+}
+
 // ---------------------------------------------------------------------------
 // acp-mcp-bridge
 // ---------------------------------------------------------------------------
@@ -268,6 +365,7 @@ fn js_stringify_matches_json_stringify() {
 async fn bridge_forwards_and_writes_json_response() {
     let server = start_server(Arc::new(|req| {
         assert_eq!(req.method, "POST");
+        assert_eq!(req.path.as_str(), "/mcp");
         assert_eq!(req.header("content-type"), Some("application/json"));
         assert_eq!(
             req.header("accept"),
@@ -304,8 +402,9 @@ async fn bridge_fans_out_json_array_response() {
     let server = start_server(Arc::new(|_| Plan::Respond {
         status: 200,
         headers: vec![("content-type".into(), "application/json".into())],
-        body: r#"[{"jsonrpc":"2.0","id":1,"result":1},{"jsonrpc":"2.0","method":"notifications/x"}]"#
-            .into(),
+        body:
+            r#"[{"jsonrpc":"2.0","id":1,"result":1},{"jsonrpc":"2.0","method":"notifications/x"}]"#
+                .into(),
     }))
     .await;
 
@@ -335,9 +434,13 @@ async fn bridge_sse_stream_parsing() {
             // multi-line data joined with \n, \r\n\r\n separator
             Part::Data("data: {\"jsonrpc\":\"2.0\",\ndata: \"id\":2,\"result\":{}}\r\n\r\n".into()),
             // \r\r separator
-            Part::Data("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\r".into()),
+            Part::Data(
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\r".into(),
+            ),
             // ignored non-data fields
-            Part::Data("event: message\nid: 5\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"n2\"}\n\n".into()),
+            Part::Data(
+                "event: message\nid: 5\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"n2\"}\n\n".into(),
+            ),
         ],
     }))
     .await;
@@ -370,12 +473,12 @@ async fn bridge_parse_error_and_ignored_lines() {
 
     let out = run_bridge_with(
         bridge_input(&[
-            "",              // blank
-            "   ",           // whitespace
-            "not json",      // parse error
-            "123",           // non-object: ignored
-            "\"str\"",       // non-object: ignored
-            "null",          // ignored
+            "",         // blank
+            "   ",      // whitespace
+            "not json", // parse error
+            "123",      // non-object: ignored
+            "\"str\"",  // non-object: ignored
+            "null",     // ignored
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         ]),
         &server.endpoint,
@@ -413,7 +516,9 @@ async fn bridge_http_error_with_and_without_id() {
 
     assert_eq!(
         out_lines(&out),
-        vec![r#"{"jsonrpc":"2.0","id":5,"error":{"code":-32603,"message":"T3 Code MCP endpoint responded with HTTP 500."}}"#]
+        vec![
+            r#"{"jsonrpc":"2.0","id":5,"error":{"code":-32603,"message":"T3 Code MCP endpoint responded with HTTP 500."}}"#
+        ]
     );
     assert_eq!(server.requests.lock().unwrap().len(), 2);
 }
@@ -576,11 +681,111 @@ async fn bridge_response_bypasses_barrier() {
         "client response did not bypass the session barrier"
     );
     release_init.notify_waiters();
-    timeout(Duration::from_secs(10), bridge).await.unwrap().unwrap();
+    timeout(Duration::from_secs(10), bridge)
+        .await
+        .unwrap()
+        .unwrap();
 
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].body.contains("srv-1"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_ignores_protocol_version_that_is_not_a_header_value() {
+    let server = start_server(Arc::new(|req| {
+        if req.body.contains("\"initialize\"") {
+            Plan::Respond {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"bad\r\ninjected"}}"#
+                    .into(),
+            }
+        } else {
+            Plan::Respond {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: r#"{"jsonrpc":"2.0","id":2,"result":{}}"#.into(),
+            }
+        }
+    }))
+    .await;
+
+    let out = run_bridge_with(
+        bridge_input(&[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        ]),
+        &server.endpoint,
+    )
+    .await;
+
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].header("mcp-protocol-version"), None);
+    drop(requests);
+    assert_eq!(out_lines(&out).len(), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_bounds_in_flight_forwarding() {
+    let total = MAX_IN_FLIGHT_REQUESTS + 8;
+    let gate = Arc::new(AtomicBool::new(false));
+    let server = {
+        let gate = gate.clone();
+        start_server(Arc::new(move |request| {
+            let message: Value = serde_json::from_str(&request.body).unwrap();
+            if message["result"].is_object() {
+                gate.store(true, Ordering::SeqCst);
+                return Plan::Respond {
+                    status: 202,
+                    headers: vec![],
+                    body: String::new(),
+                };
+            }
+            Plan::Stream {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                parts: vec![
+                    Part::Gate(gate.clone()),
+                    Part::Data("data: {\"jsonrpc\":\"2.0\",\"method\":\"done\"}\n\n".into()),
+                ],
+            }
+        }))
+        .await
+    };
+    let mut lines: Vec<String> = (0..total)
+        .map(|i| format!(r#"{{"jsonrpc":"2.0","id":{i},"method":"tools/call"}}"#))
+        .collect();
+    lines.push(r#"{"jsonrpc":"2.0","id":"upstream","result":{}}"#.into());
+    let input = Cursor::new(lines.join("\n").into_bytes());
+    let out = Arc::new(Mutex::new(Vec::new()));
+    timeout(
+        Duration::from_secs(10),
+        run_bridge(
+            server.endpoint.clone(),
+            "Bearer test-token".into(),
+            input,
+            out.clone(),
+        ),
+    )
+    .await
+    .expect("the response slot must remain usable while requests are gated");
+    assert!(gate.load(Ordering::SeqCst));
+    assert!(server.peak_connections.load(Ordering::SeqCst) <= MAX_IN_FLIGHT_REQUESTS + 1);
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        MAX_IN_FLIGHT_REQUESTS + 1
+    );
+    let output = out_lines(&out);
+    assert_eq!(output.len(), total);
+    assert_eq!(
+        output
+            .iter()
+            .filter(|line| line.contains("\"error\":"))
+            .count(),
+        8
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +892,83 @@ async fn call_happy_path_dedup_and_delete() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn call_rejects_excessively_nested_server_requests() {
+    let handler: Handler = Arc::new(|req| {
+        if req.method == "DELETE" {
+            return Plan::Respond {
+                status: 200,
+                headers: vec![],
+                body: String::new(),
+            };
+        }
+        if req.body.contains("\"initialize\"") {
+            return Plan::Stream {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                parts: vec![
+                    Part::Data(
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-0\",\"method\":\"ping\"}\n\n"
+                            .into(),
+                    ),
+                    Part::Data(
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":\"t3-cli-0\",\"result\":{\"protocolVersion\":\"2025-06-18\"}}\n\n"
+                            .into(),
+                    ),
+                ],
+            };
+        }
+        if req.body.contains("srv-") {
+            let pos = req.body.find("srv-").unwrap() + 4;
+            let digits: String = req.body[pos..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            let depth = digits.parse::<usize>().unwrap_or(0);
+            if depth < MAX_SERVER_REQUEST_DEPTH + 8 {
+                return Plan::Stream {
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/event-stream".into())],
+                    parts: vec![Part::Data(format!(
+                        "data: {{\"jsonrpc\":\"2.0\",\"id\":\"srv-{}\",\"method\":\"ping\"}}\n\n",
+                        depth + 1
+                    ))],
+                };
+            }
+            return Plan::Respond {
+                status: 202,
+                headers: vec![],
+                body: String::new(),
+            };
+        }
+        if req.body.contains("notifications/initialized") {
+            return Plan::Respond {
+                status: 202,
+                headers: vec![],
+                body: String::new(),
+            };
+        }
+        Plan::Respond {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: r#"{"jsonrpc":"2.0","id":"t3-cli-1","result":{}}"#.into(),
+        }
+    });
+    let server = start_server(handler).await;
+
+    let err = timeout(
+        Duration::from_secs(10),
+        acp_mcp_call(&server.endpoint, "Bearer test-token", "tool", json!({})),
+    )
+    .await
+    .expect("timed out")
+    .expect_err("nested server requests should fail closed");
+    assert_eq!(
+        err.message,
+        format!("T3 Code MCP server request nesting exceeded {MAX_SERVER_REQUEST_DEPTH} levels.")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn call_replies_to_server_requests_midstream() {
     let ping_gate = Arc::new(Notify::new());
     let bogus_gate = Arc::new(Notify::new());
@@ -742,10 +1024,7 @@ async fn call_replies_to_server_requests_midstream() {
                     ],
                 }
             } else if req.body.contains("srv-p1") {
-                assert_eq!(
-                    req.body,
-                    r#"{"jsonrpc":"2.0","id":"srv-p1","result":{}}"#
-                );
+                assert_eq!(req.body, r#"{"jsonrpc":"2.0","id":"srv-p1","result":{}}"#);
                 ping_gate.notify_one();
                 Plan::Respond {
                     status: 202,
@@ -817,10 +1096,7 @@ async fn call_http_error_still_deletes_session() {
     .await
     .expect("timed out")
     .expect_err("expected failure");
-    assert_eq!(
-        err.message,
-        "T3 Code MCP endpoint responded with HTTP 500."
-    );
+    assert_eq!(err.message, "T3 Code MCP endpoint responded with HTTP 500.");
 
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
@@ -844,7 +1120,9 @@ async fn call_rpc_error_message() {
                     ("content-type".into(), "application/json".into()),
                     ("mcp-session-id".into(), "s".into()),
                 ],
-                body: r#"{"jsonrpc":"2.0","id":"t3-cli-0","result":{"protocolVersion":"2025-06-18"}}"#.into(),
+                body:
+                    r#"{"jsonrpc":"2.0","id":"t3-cli-0","result":{"protocolVersion":"2025-06-18"}}"#
+                        .into(),
             }
         } else if req.body.contains("notifications/initialized") {
             Plan::Respond {

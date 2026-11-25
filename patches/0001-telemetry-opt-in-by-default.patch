@@ -1,8 +1,8 @@
 diff --git a/apps/server/src/telemetry/AnalyticsService.ts b/apps/server/src/telemetry/AnalyticsService.ts
-index eb222ae743..520ff5eeed 100644
+index 5e1a93c9d7..e09e3989b3 100644
 --- a/apps/server/src/telemetry/AnalyticsService.ts
 +++ b/apps/server/src/telemetry/AnalyticsService.ts
-@@ -71,7 +71,7 @@ const TelemetryEnvConfig = Config.all({
+@@ -73,7 +73,7 @@ const TelemetryEnvConfig = Config.all({
    posthogHost: Config.String("T3CODE_POSTHOG_HOST").pipe(
      Config.withDefault("https://ingest.t3.codes"),
    ),
@@ -11,7 +11,7 @@ index eb222ae743..520ff5eeed 100644
    flushBatchSize: Config.Number("T3CODE_TELEMETRY_FLUSH_BATCH_SIZE").pipe(Config.withDefault(20)),
    maxBufferedEvents: Config.Number("T3CODE_TELEMETRY_MAX_BUFFERED_EVENTS").pipe(
      Config.withDefault(1_000),
-@@ -134,7 +134,7 @@ export const make = Effect.gen(function* () {
+@@ -137,7 +137,7 @@ export const make = Effect.gen(function* () {
        return Effect.succeed(false);
      const preference = hostEnvironment.T3CODE_TELEMETRY_ENABLED;
      return Config.Boolean("T3CODE_TELEMETRY_ENABLED").pipe(
@@ -21,21 +21,38 @@ index eb222ae743..520ff5eeed 100644
          ConfigProvider.ConfigProvider,
          ConfigProvider.fromEnv({
 diff --git a/packages/shared/src/otelEnvironment.test.ts b/packages/shared/src/otelEnvironment.test.ts
-index 21df52609f..7fbb08a712 100644
+index 21df52609f..cd396424fd 100644
 --- a/packages/shared/src/otelEnvironment.test.ts
 +++ b/packages/shared/src/otelEnvironment.test.ts
-@@ -387,8 +387,9 @@ describe("OtelEnvironment", () => {
+@@ -387,17 +387,25 @@ describe("OtelEnvironment", () => {
  });
  
  describe("isRelayTracingEnabled", () => {
 -  it("defaults on and respects the T3CODE SDK override of the standard kill switch", () => {
 -    assert.isTrue(OtelEnvironment.isRelayTracingEnabled({}));
+-    assert.isFalse(OtelEnvironment.isRelayTracingEnabled({ OTEL_SDK_DISABLED: "true" }));
 +  it("defaults off, enables on explicit T3CODE_TELEMETRY_ENABLED=true, and respects the T3CODE SDK override of the standard kill switch", () => {
 +    assert.isFalse(OtelEnvironment.isRelayTracingEnabled({}));
 +    assert.isTrue(OtelEnvironment.isRelayTracingEnabled({ T3CODE_TELEMETRY_ENABLED: "true" }));
-     assert.isFalse(OtelEnvironment.isRelayTracingEnabled({ OTEL_SDK_DISABLED: "true" }));
++    assert.isFalse(
++      OtelEnvironment.isRelayTracingEnabled({
++        T3CODE_TELEMETRY_ENABLED: "true",
++        OTEL_SDK_DISABLED: "true",
++      }),
++    );
      assert.isTrue(
        OtelEnvironment.isRelayTracingEnabled({
++        T3CODE_TELEMETRY_ENABLED: "true",
+         OTEL_SDK_DISABLED: "true",
+         T3CODE_OTEL_SDK_DISABLED: "false",
+       }),
+     );
+     assert.isFalse(
+       OtelEnvironment.isRelayTracingEnabled({
++        T3CODE_TELEMETRY_ENABLED: "true",
+         OTEL_SDK_DISABLED: "false",
+         T3CODE_OTEL_SDK_DISABLED: "true",
+       }),
 diff --git a/packages/shared/src/otelEnvironment.ts b/packages/shared/src/otelEnvironment.ts
 index 95392206a8..39fdbd3337 100644
 --- a/packages/shared/src/otelEnvironment.ts

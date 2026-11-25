@@ -5,6 +5,8 @@ use serde_json::Value;
 use t3_rust_bridge::{acp_mcp_call, dedup_structured_content, js_stringify, run_bridge};
 use tokio::sync::Mutex;
 
+const MAX_ARGUMENTS_BYTES: u64 = 64 * 1024 * 1024;
+
 const USAGE: &str = "Usage: t3-rust-bridge <command> [args]\n\
 \n\
 Commands:\n\
@@ -21,7 +23,7 @@ fn require_env(command: &str) -> Option<(String, String)> {
     match (endpoint, authorization) {
         (Some(endpoint), Some(authorization)) => Some((endpoint, authorization)),
         _ => {
-            eprint!("{command} requires T3_ACP_MCP_ENDPOINT and T3_ACP_MCP_AUTHORIZATION.\n");
+            eprintln!("{command} requires T3_ACP_MCP_ENDPOINT and T3_ACP_MCP_AUTHORIZATION.");
             None
         }
     }
@@ -42,13 +44,26 @@ async fn cmd_call(args: &[String]) -> i32 {
         return 2;
     };
     let (Some(tool), Some(arguments_arg)) = (args.first(), args.get(1)) else {
-        eprint!("acp-mcp-call requires <tool> and <arguments-json>, or - to read it from stdin.\n");
+        eprintln!("acp-mcp-call requires <tool> and <arguments-json>, or - to read it from stdin.");
         return 2;
     };
     // PowerShell strips JSON quotes on the command line; stdin keeps them.
     let arguments_json = if arguments_arg == "-" {
         let mut buf = Vec::new();
-        let _ = std::io::stdin().read_to_end(&mut buf);
+        let read = std::io::stdin()
+            .take(MAX_ARGUMENTS_BYTES + 1)
+            .read_to_end(&mut buf);
+        if read.is_err() {
+            eprintln!("acp-mcp-call failed to read arguments from stdin.");
+            return 2;
+        }
+        if buf.len() as u64 > MAX_ARGUMENTS_BYTES {
+            eprintln!(
+                "acp-mcp-call arguments exceed {} bytes.",
+                MAX_ARGUMENTS_BYTES
+            );
+            return 2;
+        }
         String::from_utf8_lossy(&buf).into_owned()
     } else {
         arguments_arg.clone()
@@ -56,12 +71,12 @@ async fn cmd_call(args: &[String]) -> i32 {
     let parsed: Value = match serde_json::from_str(&arguments_json) {
         Ok(value) => value,
         Err(_) => {
-            eprint!("acp-mcp-call arguments must be valid JSON.\n");
+            eprintln!("acp-mcp-call arguments must be valid JSON.");
             return 2;
         }
     };
     if !parsed.is_object() {
-        eprint!("acp-mcp-call arguments must be a JSON object.\n");
+        eprintln!("acp-mcp-call arguments must be a JSON object.");
         return 2;
     }
     match acp_mcp_call(&endpoint, &authorization, tool, parsed).await {
@@ -83,8 +98,21 @@ async fn cmd_call(args: &[String]) -> i32 {
     }
 }
 
+fn unicode_args() -> Result<Vec<String>, std::ffi::OsString> {
+    std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string())
+        .collect()
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = match unicode_args() {
+        Ok(args) => args,
+        Err(_) => {
+            eprintln!("t3-rust-bridge: command arguments must be valid Unicode");
+            std::process::exit(2);
+        }
+    };
     let command = args.first().map(String::as_str);
     let code = match command {
         Some("-h") | Some("--help") => {

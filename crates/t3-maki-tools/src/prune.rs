@@ -4,8 +4,8 @@
 
 use serde_json::{json, Value};
 
-use crate::text::head_tail_chars;
 use crate::emit;
+use crate::text::head_tail_chars;
 
 /// Total chars of every string leaf in the JSON value.
 fn string_chars(v: &Value) -> usize {
@@ -22,8 +22,10 @@ fn string_chars(v: &Value) -> usize {
 fn prune_json_strings(v: &mut Value, budget: usize, total_string_chars: usize) {
     match v {
         Value::String(s) => {
-            let share = s.chars().count() * budget / total_string_chars.max(1);
-            if s.chars().count() > share.max(64) {
+            let len = s.chars().count();
+            let share = ((len as u128) * (budget as u128)
+                / (total_string_chars.max(1) as u128)) as usize;
+            if len > share.max(64) {
                 let (p, _, _) = head_tail_chars(s, share.max(64));
                 *s = p;
             }

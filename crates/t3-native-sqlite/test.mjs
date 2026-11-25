@@ -3,11 +3,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { test } from "node:test";
+import { after, test } from "node:test";
 
-import { NativeCheckpointWorker, NativeSqliteWorker, sqliteVersion } from "./index.mjs";
+import { sqliteModuleUrl } from "../../scripts/t3-accel.mjs";
 
-const dir = mkdtempSync(join(tmpdir(), "t3-native-sqlite-"));
+const { NativeCheckpointWorker, NativeSqliteWorker, sqliteVersion } = await import(sqliteModuleUrl);
+
+const dir = mkdtempSync(join(tmpdir(), "t3 native sqlite 前-"));
 const dbFile = join(dir, "state.sqlite");
 {
   const seed = new DatabaseSync(dbFile);
@@ -46,6 +48,12 @@ test("open rejects a non-WAL database with ERR_SQLITE_NOT_WAL", async () => {
 });
 
 let writer, readers, ckpt;
+after(async () => {
+  await ckpt?.stop();
+  await Promise.all(readers?.map((r) => r.close()) ?? []);
+  await writer?.close();
+  rmSync(dir, { recursive: true, force: true });
+});
 test("opens 4 WAL readers + 1 writer + 1 checkpoint worker", async () => {
   readers = await Promise.all(
     Array.from({ length: 4 }, () =>
@@ -111,6 +119,56 @@ test("Uint8Array BLOB roundtrip + param types", async () => {
   assert.deepEqual(types, [{ n: null, r: 1.5, s: "txt", b: 1, u: null }]);
 });
 
+test("empty BLOBs, offset views and float16 buffers", async () => {
+  const bytes = Uint8Array.of(99, 1, 2, 3, 88);
+  const float16 = typeof Float16Array === "function" ? new Float16Array([1]) : new Uint16Array([1]);
+  const buffers = [
+    new ArrayBuffer(0),
+    new Uint8Array(0),
+    new DataView(new ArrayBuffer(0)),
+    new DataView(bytes.buffer, 1, 3),
+    new Uint16Array(bytes.buffer, 0, 2),
+    float16,
+    Buffer.from([0, 1, 2]),
+  ];
+  for (const buffer of buffers) {
+    const expected = ArrayBuffer.isView(buffer)
+      ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+      : new Uint8Array(buffer);
+    const [[data]] = await exec(writer, "SELECT ?", { params: [buffer], values: true });
+    assert.deepEqual(data, expected);
+  }
+});
+
+test("parameter errors preserve JS exceptions and the worker stays usable", async () => {
+  const original = new Error("invalid binding");
+  const params = [{ get value() { throw original; } }];
+  assert.throws(() => exec(writer, "SELECT :value", { params }), (error) => error === original);
+  assert.throws(
+    () => exec(writer, "SELECT ?", { params: new Array(32_767) }),
+    { operation: "execute", code: "ERR_SQLITE_ERROR" },
+  );
+  assert.throws(
+    () => exec(writer, "SELECT ?", { params: [new Uint8Array(new SharedArrayBuffer(1))] }),
+    { operation: "execute", code: "ERR_SQLITE_ERROR" },
+  );
+  assert.deepEqual(await exec(writer, "SELECT 1 AS n"), [{ n: 1 }]);
+});
+
+test("row properties and named bindings have ordinary own-property semantics", async () => {
+  const [row] = await exec(writer, 'SELECT 1 AS "__proto__", 2 AS duplicate, 3 AS duplicate');
+  assert.equal(Object.getPrototypeOf(row), Object.prototype);
+  assert.deepEqual(row, { ["__proto__"]: 1, duplicate: 3 });
+
+  const params = Object.create({ n: 10 });
+  assert.deepEqual(await exec(writer, "SELECT :n AS n", { params: [params] }), [{ n: null }]);
+  const boundary = await exec(writer, "SELECT typeof(?) AS type, ? AS val", {
+    params: [2 ** 63, 2n ** 63n - 1n],
+    safeIntegers: true,
+  });
+  assert.deepEqual(boundary, [{ type: "real", val: 2n ** 63n - 1n }]);
+});
+
 test("transaction + savepoints + rollback", async () => {
   await exec(writer, "BEGIN IMMEDIATE", { cached: false });
   await exec(writer, "INSERT INTO t(name) VALUES ('tx1')");
@@ -164,25 +222,33 @@ test(">64KB binding works uncached", async () => {
   assert.equal(rows[0].len, big.length);
 });
 
-test("checkpoint worker checkpoints WAL on notify", async () => {
-  for (let i = 0; i < 10; i++) {
+test("checkpoint worker flushes a write below the notification threshold after idle", async () => {
+  const observe = new DatabaseSync(dbFile);
+  try {
+    observe.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    await exec(writer, "INSERT INTO t(name) VALUES ('checkpoint')");
+    const current = () => observe.prepare("PRAGMA wal_checkpoint(NOOP)").get();
+    assert(current().log > current().checkpointed);
     ckpt.notify();
-    await exec(writer, "INSERT INTO t(name) VALUES (?)", { params: [`w${i}`] });
+    let state;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      state = current();
+      if (state.log === state.checkpointed) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(ckpt.lastError(), null);
+    assert(state.log > 0);
+    assert.equal(state.log, state.checkpointed);
+  } finally {
+    observe.close();
   }
-  await new Promise((r) => setTimeout(r, 300));
-  assert.equal(ckpt.lastError(), null);
 });
 
 test("execute after close rejects; close() is graceful", async () => {
   const w = await NativeSqliteWorker.open({ filename: dbFile, readOnly: true, requireWal: true });
-  await w.close();
+  const closing = w.close();
+  assert.equal(w.close(), closing);
+  await closing;
   await assert.rejects(exec(w, "SELECT 1"), /closed/);
   await w.close(); // idempotent
-});
-
-test("shutdown all workers cleanly", async () => {
-  await ckpt.stop();
-  await Promise.all(readers.map((r) => r.close()));
-  await writer.close();
-  rmSync(dir, { recursive: true, force: true });
 });

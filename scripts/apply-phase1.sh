@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SCRIPT_DIR}/../systemd/memory-tuning.conf"
-DST_DIR="${HOME}/.config/systemd/user/t3code.service.d"
+DST_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/t3code.service.d"
 DST="${DST_DIR}/memory-tuning.conf"
 BRIDGE_BIN="${HOME}/.local/bin/t3-rust-bridge"
 
@@ -25,11 +25,14 @@ fi
 
 mkdir -p "$DST_DIR"
 if [[ -f "$DST" ]] && ! cmp -s "$SRC" "$DST"; then
-    BACKUP="${DST}.bak.$(date +%Y%m%d%H%M%S)"
+    BACKUP="$(mktemp "${DST}.bak.XXXXXX")"
     cp -p "$DST" "$BACKUP"
     echo "backed up existing drop-in to $BACKUP"
 fi
-install -m 0644 "$SRC" "$DST"
+temp="$(mktemp "${DST}.tmp.XXXXXX")"
+trap 'rm -f -- "$temp"' EXIT
+install -m 0644 -- "$SRC" "$temp"
+mv -fT -- "$temp" "$DST"
 echo "installed $DST"
 
 cat <<'EOF'

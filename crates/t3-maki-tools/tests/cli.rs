@@ -21,19 +21,36 @@ fn write(path: &Path, content: &str) {
 }
 
 fn run(args: &[&str], stdin: &[u8]) -> (Value, i32) {
-    let mut child = Command::new(BIN)
-        .args(args)
+    run_with_env(args, stdin, &[])
+}
+
+fn run_with_env(args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> (Value, i32) {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
     child.stdin.take().unwrap().write_all(stdin).unwrap();
     let out = child.wait_with_output().unwrap();
     let code = out.status.code().unwrap_or(-1);
-    let v: Value = serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("bad JSON from {args:?}: {e}\n{}", String::from_utf8_lossy(&out.stdout)));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "bad JSON from {args:?}: {e}\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
     (v, code)
+}
+
+/// Quote a string as a Python literal. JSON string escaping is compatible for
+/// the path text used here and, unlike the current tests' original single
+/// quotes, remains correct when Windows paths contain backslashes.
+fn py_string(text: &str) -> String {
+    serde_json::to_string(text).unwrap()
 }
 
 fn ok(v: &Value) -> &Value {
@@ -200,7 +217,9 @@ fn index_markdown_fallback() {
 fn index_max_lines_truncation() {
     let dir = tmpdir("trunc");
     let f = dir.join("many.py");
-    let src: String = (0..100).map(|i| format!("def f{i}():\n    return {i}\n\n")).collect();
+    let src: String = (0..100)
+        .map(|i| format!("def f{i}():\n    return {i}\n\n"))
+        .collect();
     write(&f, &src);
     let (v, _) = run(
         &["index", "--path", f.to_str().unwrap(), "--max-lines", "10"],
@@ -208,7 +227,10 @@ fn index_max_lines_truncation() {
     );
     let v = ok(&v);
     assert_eq!(v["truncated"], true);
-    assert!(v["skeleton"].as_str().unwrap().contains("more lines truncated"));
+    assert!(v["skeleton"]
+        .as_str()
+        .unwrap()
+        .contains("more lines truncated"));
 }
 
 // ---------------- slice ----------------
@@ -229,7 +251,13 @@ fn slice_by_symbol_bare_and_qualified() {
 
     // Type::method qualified lookup.
     let (v, _) = run(
-        &["slice", "--path", f.to_str().unwrap(), "--symbol", "Foo::new"],
+        &[
+            "slice",
+            "--path",
+            f.to_str().unwrap(),
+            "--symbol",
+            "Foo::new",
+        ],
         b"",
     );
     let v = ok(&v);
@@ -245,7 +273,13 @@ fn slice_by_line_range() {
     write(&f, "a = 1\nb = 2\nc = 3\nd = 4\n");
     let (v, _) = run(
         &[
-            "slice", "--path", f.to_str().unwrap(), "--start", "2", "--end", "3",
+            "slice",
+            "--path",
+            f.to_str().unwrap(),
+            "--start",
+            "2",
+            "--end",
+            "3",
         ],
         b"",
     );
@@ -264,7 +298,13 @@ fn slice_python_class_method_dot_syntax() {
         "class Worker:\n    def run(self):\n        return 1\n    def stop(self):\n        return 2\n",
     );
     let (v, _) = run(
-        &["slice", "--path", f.to_str().unwrap(), "--symbol", "Worker.stop"],
+        &[
+            "slice",
+            "--path",
+            f.to_str().unwrap(),
+            "--symbol",
+            "Worker.stop",
+        ],
         b"",
     );
     let v = ok(&v);
@@ -286,7 +326,10 @@ fn slice_go_receiver_qualified_method() {
     );
     let v = ok(&v);
     assert_eq!(v["symbol"], "S::Get");
-    assert!(v["content"].as_str().unwrap().contains("func (s *S) Get() int"));
+    assert!(v["content"]
+        .as_str()
+        .unwrap()
+        .contains("func (s *S) Get() int"));
 }
 
 // ---------------- grep ----------------
@@ -302,7 +345,16 @@ fn grep_ast_annotation_rust_and_ts() {
         &dir.join("sub/b.ts"),
         "export class Svc {\n  run() { return needleFunc(); }\n}\n",
     );
-    let (v, code) = run(&["grep", "--pattern", "needle", "--path", dir.to_str().unwrap()], b"");
+    let (v, code) = run(
+        &[
+            "grep",
+            "--pattern",
+            "needle",
+            "--path",
+            dir.to_str().unwrap(),
+        ],
+        b"",
+    );
     assert_eq!(code, 0);
     let v = ok(&v);
     assert_eq!(v["filesMatched"], 2);
@@ -313,7 +365,10 @@ fn grep_ast_annotation_rust_and_ts() {
     assert!(out.contains("a.rs\n"), "{out}");
     assert!(out.contains("L2 [outer]: let needle = 1;"), "{out}");
     assert!(out.contains("sub/b.ts"), "{out}");
-    assert!(out.contains("L2 [Svc::run]: run() { return needleFunc(); }"), "{out}");
+    assert!(
+        out.contains("L2 [Svc::run]: run() { return needleFunc(); }"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -322,7 +377,15 @@ fn grep_glob_filter() {
     write(&dir.join("a.rs"), "fn f() { needle(); }\n");
     write(&dir.join("b.ts"), "function g() { needle(); }\n");
     let (v, _) = run(
-        &["grep", "--pattern", "needle", "--path", dir.to_str().unwrap(), "--glob", "*.rs"],
+        &[
+            "grep",
+            "--pattern",
+            "needle",
+            "--path",
+            dir.to_str().unwrap(),
+            "--glob",
+            "*.rs",
+        ],
         b"",
     );
     let v = ok(&v);
@@ -337,13 +400,31 @@ fn grep_lockfile_skipped_in_dir_but_targeted_directly() {
     let dir = tmpdir("grep_lock");
     write(&dir.join("Cargo.lock"), "version = 3\nneedle = true\n");
     write(&dir.join("a.rs"), "fn f() {}\n");
-    let (v, _) = run(&["grep", "--pattern", "needle", "--path", dir.to_str().unwrap()], b"");
+    let (v, _) = run(
+        &[
+            "grep",
+            "--pattern",
+            "needle",
+            "--path",
+            dir.to_str().unwrap(),
+        ],
+        b"",
+    );
     let v = ok(&v);
     assert_eq!(v["filesMatched"], 0, "{}", v["output"]);
     assert_eq!(v["totalHits"], 0);
 
     let lock = dir.join("Cargo.lock");
-    let (v, _) = run(&["grep", "--pattern", "needle", "--path", lock.to_str().unwrap()], b"");
+    let (v, _) = run(
+        &[
+            "grep",
+            "--pattern",
+            "needle",
+            "--path",
+            lock.to_str().unwrap(),
+        ],
+        b"",
+    );
     let v = ok(&v);
     assert_eq!(v["filesMatched"], 1);
     assert!(v["output"].as_str().unwrap().contains("needle = true"));
@@ -358,7 +439,15 @@ fn grep_max_hits_and_byte_truncation() {
     }
     write(&dir.join("many.rs"), &src);
     let (v, _) = run(
-        &["grep", "--pattern", "needle", "--path", dir.to_str().unwrap(), "--max-hits", "3"],
+        &[
+            "grep",
+            "--pattern",
+            "needle",
+            "--path",
+            dir.to_str().unwrap(),
+            "--max-hits",
+            "3",
+        ],
         b"",
     );
     let v = ok(&v);
@@ -369,8 +458,13 @@ fn grep_max_hits_and_byte_truncation() {
 
     let (v, _) = run(
         &[
-            "grep", "--pattern", "needle", "--path", dir.to_str().unwrap(),
-            "--max-bytes", "120",
+            "grep",
+            "--pattern",
+            "needle",
+            "--path",
+            dir.to_str().unwrap(),
+            "--max-bytes",
+            "120",
         ],
         b"",
     );
@@ -385,10 +479,16 @@ fn grep_max_hits_and_byte_truncation() {
 fn grep_invalid_regex_error_json() {
     let dir = tmpdir("grep_badre");
     write(&dir.join("a.rs"), "fn f() {}\n");
-    let (v, code) = run(&["grep", "--pattern", "(", "--path", dir.to_str().unwrap()], b"");
+    let (v, code) = run(
+        &["grep", "--pattern", "(", "--path", dir.to_str().unwrap()],
+        b"",
+    );
     assert_eq!(code, 1);
     assert_eq!(v["ok"], false);
-    assert!(v["error"].as_str().unwrap().contains("invalid --pattern regex"));
+    assert!(v["error"]
+        .as_str()
+        .unwrap()
+        .contains("invalid --pattern regex"));
 }
 
 #[test]
@@ -398,7 +498,16 @@ fn grep_skips_noise_dirs() {
     write(&dir.join("node_modules/dep.js"), "needle();\n");
     write(&dir.join("target/out.rs"), "needle();\n");
     write(&dir.join("x.min.js"), "needle();\n");
-    let (v, _) = run(&["grep", "--pattern", "needle", "--path", dir.to_str().unwrap()], b"");
+    let (v, _) = run(
+        &[
+            "grep",
+            "--pattern",
+            "needle",
+            "--path",
+            dir.to_str().unwrap(),
+        ],
+        b"",
+    );
     let v = ok(&v);
     assert_eq!(v["filesMatched"], 1);
     let out = v["output"].as_str().unwrap();
@@ -406,6 +515,31 @@ fn grep_skips_noise_dirs() {
     assert!(!out.contains("dep.js"), "{out}");
     assert!(!out.contains("out.rs"), "{out}");
     assert!(!out.contains("x.min.js"), "{out}");
+}
+
+#[test]
+fn grep_deeply_nested_source_is_bounded() {
+    let dir = tmpdir("grep_deep_nesting");
+    let depth = 1200;
+    let src = format!(
+        "const x = {}needle{};\n",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    );
+    write(&dir.join("deep.ts"), &src);
+    let (v, code) = run(
+        &[
+            "grep",
+            "--pattern",
+            "needle",
+            "--path",
+            dir.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert_eq!(code, 0);
+    let v = ok(&v);
+    assert_eq!(v["totalHits"], 1);
 }
 
 // ---------------- diff ----------------
@@ -442,7 +576,10 @@ fn diff_working_tree() {
     let dir = git_repo("diff_wt");
     write(&dir.join("a.rs"), "fn main() {\n    println!(\"v1\");\n}\n");
     git_commit(&dir, "init");
-    write(&dir.join("a.rs"), "fn main() {\n    println!(\"v2\");\n    println!(\"x\");\n}\n");
+    write(
+        &dir.join("a.rs"),
+        "fn main() {\n    println!(\"v2\");\n    println!(\"x\");\n}\n",
+    );
     let (v, code) = run(&["diff", "--cwd", dir.to_str().unwrap()], b"");
     assert_eq!(code, 0);
     let v = ok(&v);
@@ -467,7 +604,13 @@ fn diff_rev_range() {
     write(&dir.join("a.rs"), "fn main() {\n    go();\n}\n");
     git_commit(&dir, "v2");
     let (v, _) = run(
-        &["diff", "--cwd", dir.to_str().unwrap(), "--rev", "HEAD~1..HEAD"],
+        &[
+            "diff",
+            "--cwd",
+            dir.to_str().unwrap(),
+            "--rev",
+            "HEAD~1..HEAD",
+        ],
         b"",
     );
     let v = ok(&v);
@@ -501,12 +644,43 @@ fn diff_lockfile_excluded_and_counted() {
 
     // --path explicitly targeting the lockfile includes it.
     let (v, _) = run(
-        &["diff", "--cwd", dir.to_str().unwrap(), "--path", "Cargo.lock"],
+        &[
+            "diff",
+            "--cwd",
+            dir.to_str().unwrap(),
+            "--path",
+            "Cargo.lock",
+        ],
         b"",
     );
     let v = ok(&v);
     assert_eq!(v["skippedGenerated"], 0);
     assert!(v["diff"].as_str().unwrap().contains("lockv2"));
+}
+
+#[test]
+fn diff_rejects_option_like_rev_without_invoking_git() {
+    let dir = git_repo("diff_rev_injection");
+    write(&dir.join("a.rs"), "fn main() {}\n");
+    git_commit(&dir, "init");
+    let planted = dir.join("evil.patch");
+    let rev = format!("--output={}", planted.display());
+    let (v, code) = run(
+        &[
+            "diff",
+            "--cwd",
+            dir.to_str().unwrap(),
+            &format!("--rev={rev}"),
+        ],
+        b"",
+    );
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["error"].as_str().unwrap().contains("invalid --rev"),
+        "{v}"
+    );
+    assert!(!planted.exists(), "git --output must not be reached");
 }
 
 #[test]
@@ -538,15 +712,15 @@ fn diff_max_bytes_truncation() {
 
 #[test]
 fn exec_chains_helpers_and_truncates() {
-    let dir = tmpdir("exec");
+    let dir = tmpdir("exec with space");
     let f = dir.join("target.rs");
     write(&f, RUST_SRC);
     let script = format!(
-        "sk = index('{}')\nprint('SYMS', len(sk.splitlines()))\nbody = slice_code('{}', symbol='helper')\nprint('BODY', body.strip())\nhits = grep(r'fn ', '{}')\nprint('HITS', len(hits.splitlines()))\nfiles = glob_files('*.rs', '{}')\nprint('FILES', files)\n",
-        f.display(),
-        f.display(),
-        dir.display(),
-        dir.display()
+        "sk = index({})\nprint('SYMS', len(sk.splitlines()))\nbody = slice_code({}, symbol='helper')\nprint('BODY', body.strip())\nhits = grep(r'fn ', {})\nprint('HITS', len(hits.splitlines()))\nfiles = glob_files('*.rs', {})\nprint('FILES', files)\n",
+        py_string(&f.to_string_lossy()),
+        py_string(&f.to_string_lossy()),
+        py_string(&dir.to_string_lossy()),
+        py_string(&dir.to_string_lossy())
     );
     let (v, _) = run(&["exec", "--cwd", dir.to_str().unwrap()], script.as_bytes());
     let v = ok(&v);
@@ -579,6 +753,23 @@ fn exec_timeout_kills_child() {
 }
 
 #[test]
+fn exec_reaps_descendants_after_the_script_exits() {
+    let dir = tmpdir("exec_descendant");
+    let started = std::time::Instant::now();
+    let (result, _) = run(
+        &["exec", "--cwd", dir.to_str().unwrap()],
+        b"import subprocess, sys
+subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+print('done')
+",
+    );
+    let result = ok(&result);
+    assert_eq!(result["exitCode"], 0);
+    assert_eq!(result["timedOut"], false);
+    assert!(started.elapsed().as_secs() < 5);
+}
+
+#[test]
 fn exec_head_tail_truncation_keeps_end() {
     let dir = tmpdir("exec_trunc");
     let script = b"print('H' * 4000)\nprint('TAIL_MARKER' + 'T' * 4000)\n";
@@ -599,6 +790,76 @@ fn exec_head_tail_truncation_keeps_end() {
     assert!(out.starts_with('H'), "{out}");
     assert!(out.contains("bytes truncated"), "{out}");
     assert!(out.trim_end().ends_with('T'), "{out}");
+}
+
+#[test]
+fn exec_does_not_inherit_secret_environment() {
+    let dir = tmpdir("exec_env");
+    let marker = "t3mt-test-marker-value";
+    let script = b"import os\nprint('PRESENT', 'T3MT_SECRET_TEST' in os.environ)\nprint('VALUE', os.environ.get('T3MT_SECRET_TEST'))\n";
+    let (v, _) = run_with_env(
+        &["exec", "--cwd", dir.to_str().unwrap()],
+        script,
+        &[("T3MT_SECRET_TEST", marker)],
+    );
+    let v = ok(&v);
+    assert_eq!(v["exitCode"], 0, "{}", v["stderr"]);
+    let out = v["stdout"].as_str().unwrap();
+    assert!(out.contains("PRESENT False"), "{out}");
+    assert!(!out.contains(marker), "{out}");
+}
+
+#[test]
+fn exec_read_rejects_workspace_symlink_escape() {
+    let dir = tmpdir("exec_symlink");
+    let outside = tmpdir("exec_symlink_outside").join("outside.txt");
+    write(&outside, "outside-secret\n");
+    let link = dir.join("inside-link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_file(&outside, &link).is_err() {
+        // Windows test hosts commonly require a developer-mode privilege for
+        // symlinks. The production path check itself is platform-independent.
+        return;
+    }
+
+    let script = b"try:\n    read('inside-link.txt')\n    print('ALLOWED')\nexcept RuntimeError as e:\n    print('BLOCKED', 'outside workspace' in str(e))\n";
+    let (v, _) = run(&["exec", "--cwd", dir.to_str().unwrap()], script);
+    let v = ok(&v);
+    assert_eq!(v["exitCode"], 0, "{}", v["stderr"]);
+    assert!(
+        v["stdout"].as_str().unwrap().contains("BLOCKED True"),
+        "{}",
+        v["stdout"]
+    );
+}
+
+#[test]
+fn exec_huge_output_still_preserves_tail() {
+    let dir = tmpdir("exec_huge_tail");
+    let script =
+        b"import sys\nsys.stdout.write('H' * (9 * 1024 * 1024))\nsys.stdout.write('TAIL_MARKER')\n";
+    let (v, _) = run(
+        &[
+            "exec",
+            "--cwd",
+            dir.to_str().unwrap(),
+            "--max-bytes",
+            "2000",
+        ],
+        script,
+    );
+    let v = ok(&v);
+    assert_eq!(v["exitCode"], 0, "{}", v["stderr"]);
+    assert_eq!(v["truncated"], true);
+    let out = v["stdout"].as_str().unwrap();
+    assert!(out.len() <= 2000, "{}", out.len());
+    assert!(
+        out.ends_with("TAIL_MARKER"),
+        "tail missing: {}",
+        &out[out.len().saturating_sub(100)..]
+    );
 }
 
 // ---------------- econ ----------------
@@ -659,6 +920,15 @@ fn prune_passthrough_small() {
     assert_eq!(v["text"], "hello");
     assert_eq!(v["originalChars"], 5);
     assert_eq!(v["finalChars"], 5);
+}
+
+#[test]
+fn stdin_over_defensive_cap_is_json_error() {
+    let input = vec![b'x'; 16 * 1024 * 1024 + 1];
+    let (v, code) = run(&["prune", "--max-chars", "100"], &input);
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().unwrap().contains("input limit"), "{v}");
 }
 
 // ---------------- misc ----------------

@@ -5,11 +5,9 @@
 //! `JSON.stringify` semantics (insertion-ordered keys, shortest-round-trip
 //! floats, U+2028/U+2029 left raw).
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -20,6 +18,14 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinSet;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+// Bound untrusted input at the process boundary. These limits are far above
+// normal MCP traffic but prevent a peer from growing memory without bound.
+const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const MAX_IN_FLIGHT_REQUEST_BYTES: usize = 2 * MAX_PAYLOAD_BYTES;
+const MAX_SERVER_REQUEST_DEPTH: usize = 32;
+const SSE_SEPARATOR_OVERLAP: usize = 3;
 
 // ---------------------------------------------------------------------------
 // JSON.stringify-compatible serialization
@@ -113,14 +119,14 @@ fn js_float(v: f64) -> String {
     }
     if n >= k && n <= 21 {
         out.push_str(&digits);
-        out.extend(std::iter::repeat('0').take((n - k) as usize));
+        out.extend(std::iter::repeat_n('0', (n - k) as usize));
     } else if n > 0 && n <= 21 {
         out.push_str(&digits[..n as usize]);
         out.push('.');
         out.push_str(&digits[n as usize..]);
     } else if n > -6 && n <= 0 {
         out.push_str("0.");
-        out.extend(std::iter::repeat('0').take((-n) as usize));
+        out.extend(std::iter::repeat_n('0', (-n) as usize));
         out.push_str(&digits);
     } else {
         out.push_str(&digits[..1]);
@@ -129,7 +135,7 @@ fn js_float(v: f64) -> String {
             out.push_str(&digits[1..]);
         }
         out.push('e');
-        if n - 1 >= 0 {
+        if n > 0 {
             out.push('+');
         } else {
             out.push('-');
@@ -149,16 +155,24 @@ struct SharedState {
     protocol_version: StdMutex<Option<String>>,
 }
 
+fn shared_lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // Session metadata is small and independent, so a poisoned lock is still
+    // safe to inspect. Avoid turning an unrelated panic into a bridge-wide one.
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl SharedState {
     fn set_session_id(&self, id: &str) {
-        *self.session_id.lock().unwrap() = Some(id.to_string());
+        *shared_lock(&self.session_id) = Some(id.to_string());
     }
 
     fn apply_headers(&self, mut builder: http::request::Builder) -> http::request::Builder {
-        if let Some(sid) = self.session_id.lock().unwrap().clone() {
+        if let Some(sid) = shared_lock(&self.session_id).clone() {
             builder = builder.header("mcp-session-id", sid);
         }
-        if let Some(pv) = self.protocol_version.lock().unwrap().clone() {
+        if let Some(pv) = shared_lock(&self.protocol_version).clone() {
             builder = builder.header("mcp-protocol-version", pv);
         }
         builder
@@ -170,12 +184,12 @@ fn protocol_version_of(value: &Value) -> Option<&str> {
         .get("result")?
         .get("protocolVersion")?
         .as_str()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && http::header::HeaderValue::from_str(s).is_ok())
 }
 
 fn update_protocol_version(state: &SharedState, value: &Value) {
     if let Some(pv) = protocol_version_of(value) {
-        *state.protocol_version.lock().unwrap() = Some(pv.to_string());
+        *shared_lock(&state.protocol_version) = Some(pv.to_string());
     }
 }
 
@@ -209,9 +223,7 @@ async fn http_post(
             .header("content-type", "application/json"),
         authorization,
     ));
-    let request = builder
-        .body(Full::new(body))
-        .map_err(|e| e.to_string())?;
+    let request = builder.body(Full::new(body)).map_err(|e| e.to_string())?;
     let response = client.request(request).await.map_err(|e| e.to_string())?;
     if let Some(sid) = response
         .headers()
@@ -235,7 +247,7 @@ async fn http_delete(
     ));
     if let Ok(request) = builder.body(Full::new(Bytes::new())) {
         if let Ok(response) = client.request(request).await {
-            let _ = response.into_body().collect().await;
+            let _ = collect_body_limited(response.into_body()).await;
         }
     }
 }
@@ -244,10 +256,69 @@ async fn http_delete(
 // Response payload reader (JSON body or incremental SSE)
 // ---------------------------------------------------------------------------
 
+fn response_too_large() -> String {
+    format!(
+        "T3 Code MCP response payload exceeded {} bytes.",
+        MAX_PAYLOAD_BYTES
+    )
+}
+
+async fn collect_body_limited(mut body: Incoming) -> Result<Bytes, String> {
+    let mut bytes = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| e.to_string())?;
+        if let Ok(data) = frame.into_data() {
+            if bytes.len().saturating_add(data.len()) > MAX_PAYLOAD_BYTES {
+                return Err(response_too_large());
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(bytes.freeze())
+}
+
+/// Incremental SSE event splitter. It keeps the unscanned tail small, matching
+/// the linear-time behavior of the TypeScript implementation even when a large
+/// event arrives in many small network frames.
+#[derive(Default)]
+struct SseParser {
+    buf: BytesMut,
+    scan_pos: usize,
+}
+
+impl SseParser {
+    fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn next_event(&mut self) -> Result<Option<String>, String> {
+        let start = self.scan_pos.min(self.buf.len());
+        if let Some((end, consume)) = find_sse_separator(&self.buf[start..]) {
+            let event_end = start + end;
+            if event_end > MAX_PAYLOAD_BYTES {
+                return Err(response_too_large());
+            }
+            let consume_end = start + consume;
+            let event = String::from_utf8_lossy(&self.buf[..event_end]).into_owned();
+            self.buf.advance(consume_end);
+            self.scan_pos = 0;
+            return Ok(Some(event));
+        }
+        // A separator is at most four bytes, so a separator completed by the
+        // next frame must begin within the last three bytes already buffered.
+        self.scan_pos = self.buf.len().saturating_sub(SSE_SEPARATOR_OVERLAP);
+        Ok(None)
+    }
+}
+
 struct PayloadReader {
     body: Option<Incoming>,
     sse: bool,
-    buf: Vec<u8>,
+    parser: SseParser,
     done: bool,
 }
 
@@ -267,11 +338,15 @@ impl PayloadReader {
                     .eq_ignore_ascii_case("text/event-stream")
             })
             .unwrap_or(false);
-        let body = if empty { None } else { Some(response.into_body()) };
+        let body = if empty {
+            None
+        } else {
+            Some(response.into_body())
+        };
         Self {
             body,
             sse,
-            buf: Vec::new(),
+            parser: SseParser::default(),
             done: empty,
         }
     }
@@ -289,7 +364,7 @@ impl PayloadReader {
                 return Ok(None);
             };
             self.done = true;
-            let bytes = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
+            let bytes = collect_body_limited(body).await?;
             let text = String::from_utf8_lossy(&bytes);
             if text.trim().is_empty() {
                 return Ok(None);
@@ -299,15 +374,16 @@ impl PayloadReader {
                 .map_err(|e| e.to_string());
         }
         loop {
-            while let Some((event_end, consume_end)) = find_sse_separator(&self.buf) {
-                let event = String::from_utf8_lossy(&self.buf[..event_end]).into_owned();
-                self.buf.drain(..consume_end);
+            while let Some(event) = self.parser.next_event()? {
                 let data = sse_event_data(&event);
                 if !data.is_empty() {
                     return serde_json::from_str(&data)
                         .map(Some)
                         .map_err(|e| e.to_string());
                 }
+            }
+            if self.parser.buffered_len() > MAX_PAYLOAD_BYTES + SSE_SEPARATOR_OVERLAP {
+                return Err(response_too_large());
             }
             let Some(body) = self.body.as_mut() else {
                 self.done = true;
@@ -321,7 +397,7 @@ impl PayloadReader {
                 Some(Err(e)) => return Err(e.to_string()),
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
-                        self.buf.extend_from_slice(&data);
+                        self.parser.push(&data);
                     }
                 }
             }
@@ -378,41 +454,16 @@ fn find_sse_separator(buf: &[u8]) -> Option<(usize, usize)> {
 /// Concatenate the `data:` fields of one raw SSE event block, matching
 /// `sseEventData` in mcpResponsePayloads.ts.
 fn sse_event_data(event: &str) -> String {
-    split_lines(event)
-        .into_iter()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(|rest| rest.trim_start())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Split on `\r\n`, lone `\r`, or `\n` (never on U+2028/U+2029).
-fn split_lines(text: &str) -> Vec<&str> {
-    let bytes = text.as_bytes();
-    let mut lines = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => {
-                lines.push(&text[start..i]);
-                i += 1;
-                start = i;
+    let mut out = String::new();
+    for line in event.split(['\r', '\n']) {
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !out.is_empty() {
+                out.push('\n');
             }
-            b'\r' => {
-                lines.push(&text[start..i]);
-                i += if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    2
-                } else {
-                    1
-                };
-                start = i;
-            }
-            _ => i += 1,
+            out.push_str(rest.trim_start());
         }
     }
-    lines.push(&text[start..]);
-    lines
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -441,17 +492,10 @@ async fn forward<W: AsyncWrite + Send + Unpin>(
     authorization: &str,
     state: &SharedState,
     out: &Mutex<W>,
-    line: &str,
+    line: String,
     id: Option<&Value>,
 ) -> Result<(), String> {
-    let response = http_post(
-        client,
-        endpoint,
-        state,
-        authorization,
-        Bytes::copy_from_slice(line.as_bytes()),
-    )
-    .await?;
+    let response = http_post(client, endpoint, state, authorization, Bytes::from(line)).await?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
         if let Some(id) = id {
@@ -465,7 +509,7 @@ async fn forward<W: AsyncWrite + Send + Unpin>(
             )
             .await;
         }
-        let _ = response.into_body().collect().await;
+        let _ = collect_body_limited(response.into_body()).await;
         return Ok(());
     }
     let mut reader = PayloadReader::new(response);
@@ -491,8 +535,16 @@ async fn run_forward<W: AsyncWrite + Send + Unpin>(
     line: String,
     id: Option<Value>,
 ) {
-    if let Err(message) =
-        forward(&client, &endpoint, &authorization, &state, &out, &line, id.as_ref()).await
+    if let Err(message) = forward(
+        &client,
+        &endpoint,
+        &authorization,
+        &state,
+        &out,
+        line,
+        id.as_ref(),
+    )
+    .await
     {
         if let Some(id) = id {
             write_value(
@@ -504,6 +556,60 @@ async fn run_forward<W: AsyncWrite + Send + Unpin>(
                 ),
             )
             .await;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedLine {
+    Eof,
+    Line,
+    TooLong,
+}
+
+/// Read one `\n`-terminated input line while bounding memory use. Bytes beyond
+/// the limit are consumed and discarded so the next line is still framed
+/// correctly. The newline itself is retained for compatibility with the
+/// existing CRLF handling.
+async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    input: &mut R,
+    raw: &mut Vec<u8>,
+    max_content_bytes: usize,
+) -> std::io::Result<BoundedLine> {
+    raw.clear();
+    let mut too_long = false;
+    loop {
+        let buf = input.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(if too_long {
+                BoundedLine::TooLong
+            } else if raw.is_empty() {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line
+            });
+        }
+        let newline_pos = buf.iter().position(|b| *b == b'\n');
+        let content_end = newline_pos.unwrap_or(buf.len());
+        let consume_len = newline_pos.map(|pos| pos + 1).unwrap_or(buf.len());
+        if !too_long {
+            let room = max_content_bytes.saturating_sub(raw.len());
+            let copy_len = content_end.min(room);
+            raw.extend_from_slice(&buf[..copy_len]);
+            if content_end > room {
+                too_long = true;
+            }
+        }
+        if newline_pos.is_some() && !too_long {
+            raw.push(b'\n');
+        }
+        input.consume(consume_len);
+        if newline_pos.is_some() {
+            return Ok(if too_long {
+                BoundedLine::TooLong
+            } else {
+                BoundedLine::Line
+            });
         }
     }
 }
@@ -527,15 +633,32 @@ pub async fn run_bridge<R, W>(
 {
     let client = Arc::new(http_client());
     let state = Arc::new(SharedState::default());
-    let mut tasks = JoinSet::new();
+    let mut requests = JoinSet::new();
+    let mut replies = JoinSet::new();
+    let request_bytes = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+    let reply_bytes = Arc::new(tokio::sync::Semaphore::new(MAX_PAYLOAD_BYTES));
     let mut pending_barrier: Option<watch::Receiver<bool>> = None;
 
     let mut raw = Vec::new();
     loop {
-        raw.clear();
-        match input.read_until(b'\n', &mut raw).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        match read_line_bounded(&mut input, &mut raw, MAX_PAYLOAD_BYTES).await {
+            Ok(BoundedLine::Eof) | Err(_) => break,
+            Ok(BoundedLine::TooLong) => {
+                write_value(
+                    &output,
+                    &error_envelope(
+                        Value::Null,
+                        -32603,
+                        &format!(
+                            "T3 Code MCP bridge input message exceeded {} bytes.",
+                            MAX_PAYLOAD_BYTES
+                        ),
+                    ),
+                )
+                .await;
+                continue;
+            }
+            Ok(BoundedLine::Line) => {}
         }
         let mut end = raw.len();
         if end > 0 && raw[end - 1] == b'\n' {
@@ -576,20 +699,44 @@ pub async fn run_bridge<R, W>(
         let is_session_handshake =
             method == Some("initialize") || method == Some("notifications/initialized");
 
-        let spawn_forward = |tasks: &mut JoinSet<()>| {
-            tasks.spawn(run_forward(
-                client.clone(),
-                endpoint.clone(),
-                authorization.clone(),
-                state.clone(),
-                output.clone(),
-                line.clone(),
-                id.clone(),
-            ));
+        while requests.try_join_next().is_some() {}
+        while replies.try_join_next().is_some() {}
+        // Give replies their own slots so a full request queue cannot prevent
+        // a server-initiated request from receiving its reply.
+        let (tasks, bytes) = if is_response {
+            (&mut replies, &reply_bytes)
+        } else {
+            (&mut requests, &request_bytes)
+        };
+        let slots_available = tasks.len() < MAX_IN_FLIGHT_REQUESTS;
+        let permit = slots_available
+            .then(|| bytes.clone().try_acquire_many_owned(line.len() as u32).ok())
+            .flatten();
+        let Some(permit) = permit else {
+            if let Some(id) = id.filter(|_| !is_response) {
+                write_value(
+                    &output,
+                    &error_envelope(
+                        id,
+                        -32603,
+                        "T3 Code MCP bridge has too many in-flight requests.",
+                    ),
+                )
+                .await;
+            }
+            continue;
         };
 
         if is_response {
-            spawn_forward(&mut tasks);
+            let client = client.clone();
+            let endpoint = endpoint.clone();
+            let authorization = authorization.clone();
+            let state = state.clone();
+            let output = output.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                run_forward(client, endpoint, authorization, state, output, line, None).await;
+            });
         } else if is_session_handshake {
             let prior = pending_barrier.take();
             let (tx, rx) = watch::channel(false);
@@ -600,9 +747,8 @@ pub async fn run_bridge<R, W>(
                 let authorization = authorization.clone();
                 let state = state.clone();
                 let output = output.clone();
-                let line = line.clone();
-                let id = id.clone();
                 async move {
+                    let _permit = permit;
                     if let Some(prior) = prior {
                         wait_done(prior).await;
                     }
@@ -618,9 +764,8 @@ pub async fn run_bridge<R, W>(
                 let authorization = authorization.clone();
                 let state = state.clone();
                 let output = output.clone();
-                let line = line.clone();
-                let id = id.clone();
                 async move {
+                    let _permit = permit;
                     if let Some(barrier) = barrier {
                         wait_done(barrier).await;
                     }
@@ -629,7 +774,8 @@ pub async fn run_bridge<R, W>(
             });
         }
     }
-    while tasks.join_next().await.is_some() {}
+    while requests.join_next().await.is_some() {}
+    while replies.join_next().await.is_some() {}
 }
 
 // ---------------------------------------------------------------------------
@@ -672,42 +818,67 @@ fn server_request_reply(payload: &Value) -> Option<Value> {
     })
 }
 
-fn session_send<'a>(
-    client: &'a HttpClient,
-    endpoint: &'a str,
-    state: &'a SharedState,
-    authorization: &'a str,
+async fn session_post(
+    client: &HttpClient,
+    endpoint: &str,
+    state: &SharedState,
+    authorization: &str,
     message: Value,
-) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, BridgeError>> + Send + 'a>> {
-    Box::pin(async move {
-        let response = http_post(
-            client,
-            endpoint,
-            state,
-            authorization,
-            Bytes::from(js_stringify(&message)),
-        )
-        .await
-        .map_err(BridgeError::new)?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let _ = response.into_body().collect().await;
-            return Err(BridgeError::new(format!(
-                "T3 Code MCP endpoint responded with HTTP {status}."
-            )));
-        }
-        let mut reader = PayloadReader::new(response);
-        let mut payloads = Vec::new();
-        while let Some(payload) = reader.next_payload().await.map_err(BridgeError::new)? {
-            update_protocol_version(state, &payload);
-            if let Some(reply) = server_request_reply(&payload) {
-                session_send(client, endpoint, state, authorization, reply).await?;
-            } else {
-                payloads.push(payload);
+) -> Result<http::Response<Incoming>, BridgeError> {
+    let response = http_post(
+        client,
+        endpoint,
+        state,
+        authorization,
+        Bytes::from(js_stringify(&message)),
+    )
+    .await
+    .map_err(BridgeError::new)?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let _ = collect_body_limited(response.into_body()).await;
+        return Err(BridgeError::new(format!(
+            "T3 Code MCP endpoint responded with HTTP {status}."
+        )));
+    }
+    Ok(response)
+}
+
+async fn session_send(
+    client: &HttpClient,
+    endpoint: &str,
+    state: &SharedState,
+    authorization: &str,
+    message: Value,
+) -> Result<Vec<Value>, BridgeError> {
+    let response = session_post(client, endpoint, state, authorization, message).await?;
+    let mut readers = vec![PayloadReader::new(response)];
+    let mut payloads = Vec::new();
+    while !readers.is_empty() {
+        let next = {
+            let reader = readers.last_mut().expect("readers is not empty");
+            reader.next_payload().await.map_err(BridgeError::new)?
+        };
+        let Some(payload) = next else {
+            readers.pop();
+            continue;
+        };
+        update_protocol_version(state, &payload);
+        if let Some(reply) = server_request_reply(&payload) {
+            if readers.len() >= MAX_SERVER_REQUEST_DEPTH {
+                return Err(BridgeError::new(format!(
+                    "T3 Code MCP server request nesting exceeded {MAX_SERVER_REQUEST_DEPTH} levels."
+                )));
             }
+            let nested = session_post(client, endpoint, state, authorization, reply).await?;
+            readers.push(PayloadReader::new(nested));
+        } else if readers.len() == 1 {
+            // Responses to server-request replies are fire-and-forget in the
+            // upstream implementation; their non-request payloads are dropped.
+            payloads.push(payload);
         }
-        Ok(payloads)
-    })
+    }
+    Ok(payloads)
 }
 
 async fn session_request(
@@ -800,8 +971,12 @@ pub async fn acp_mcp_call(
     }
     .await;
 
-    if state.session_id.lock().unwrap().is_some() {
-        http_delete(&client, endpoint, &state, authorization).await;
+    if shared_lock(&state.session_id).is_some() {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            http_delete(&client, endpoint, &state, authorization),
+        )
+        .await;
     }
     outcome
 }
@@ -813,10 +988,7 @@ pub fn dedup_structured_content(result: &mut Value) {
         return;
     };
     let has_encoded = object.contains_key("structuredContent")
-        && object
-            .get("content")
-            .map(|c| c.is_array())
-            .unwrap_or(false);
+        && object.get("content").map(|c| c.is_array()).unwrap_or(false);
     if !has_encoded {
         return;
     }

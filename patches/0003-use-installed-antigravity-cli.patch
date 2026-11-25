@@ -1,0 +1,477 @@
+diff --git a/apps/server/src/provider/AntigravityInstallation.test.ts b/apps/server/src/provider/AntigravityInstallation.test.ts
+index 5dcd840991..67bb90e770 100644
+--- a/apps/server/src/provider/AntigravityInstallation.test.ts
++++ b/apps/server/src/provider/AntigravityInstallation.test.ts
+@@ -90,6 +90,7 @@ const assetRelease = (asset: AntigravityCliReleaseAsset) => ({
+ });
+ 
+ interface HarnessOptions {
++  readonly externalOnly?: boolean;
+   readonly baseDir?: string;
+   readonly asset?: AntigravityCliReleaseAsset | null;
+   readonly archive?: Buffer;
+@@ -165,6 +166,7 @@ const makeHarness = Effect.fn("test.makeAntigravityInstallation")(function* (
+   });
+   const installation = yield* AntigravityInstallation.makeAntigravityInstallation({
+     baseDir,
++    ...(options.externalOnly === undefined ? {} : { externalOnly: options.externalOnly }),
+     ...(options.native ? {} : { releaseAsset: asset }),
+     ...(options.updateChecksEnabled === undefined
+       ? {}
+@@ -359,6 +361,24 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
+       }),
+   );
+ 
++  it.effect("uses an external CLI without requesting download metadata", () =>
++    Effect.gen(function* () {
++      const { installation, requests } = yield* makeHarness({
++        externalOnly: true,
++        native: true,
++        previous: true,
++        platform: "linux",
++        updateChecksEnabled: Effect.succeed(true),
++      });
++      yield* installation.checkForUpdate;
++      const issue = yield* installation.start.pipe(Effect.flip);
++      expect(issue.detail).toContain("Install the official Antigravity CLI separately");
++      const missing = yield* installation.resolve().pipe(Effect.flip);
++      expect(missing.detail).toContain("Install the official Antigravity CLI separately");
++      expect(requests).toEqual([]);
++    }),
++  );
++
+   it.effect.each([true, false])(
+     "respects background update checks (%s) while allowing explicit installation",
+     (enabled) =>
+diff --git a/apps/server/src/provider/AntigravityInstallation.ts b/apps/server/src/provider/AntigravityInstallation.ts
+index 569a4a6308..0f29668332 100644
+--- a/apps/server/src/provider/AntigravityInstallation.ts
++++ b/apps/server/src/provider/AntigravityInstallation.ts
+@@ -39,7 +39,6 @@ import * as EffectAcpErrors from "effect-acp/errors";
+ import { lock } from "proper-lockfile";
+ 
+ import * as ServerConfig from "../config.ts";
+-import * as ServerSettings from "../serverSettings.ts";
+ import {
+   ANTIGRAVITY_CLI_MANIFEST_BASE,
+   antigravityCliTarget,
+@@ -132,13 +131,9 @@ export class AntigravityInstallation extends Context.Service<
+     AntigravityInstallation,
+     Effect.gen(function* () {
+       const config = yield* ServerConfig.ServerConfig;
+-      const settings = yield* ServerSettings.ServerSettingsService;
+       return yield* makeAntigravityInstallation({
+         baseDir: config.baseDir,
+-        updateChecksEnabled: settings.getSettings.pipe(
+-          Effect.map((value) => value.enableProviderUpdateChecks),
+-          Effect.orElseSucceed(() => false),
+-        ),
++        externalOnly: true,
+       });
+     }),
+   );
+@@ -146,6 +141,7 @@ export class AntigravityInstallation extends Context.Service<
+ 
+ export interface AntigravityInstallationOptions {
+   readonly baseDir: string;
++  readonly externalOnly?: boolean;
+   readonly releaseAsset?: AntigravityCliReleaseAsset | null;
+   readonly updateChecksEnabled?: Effect.Effect<boolean>;
+   readonly validate?: (
+@@ -677,6 +673,17 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
+   )(
+     function* (binaryPath?: string, processEnvironment?: NodeJS.ProcessEnv) {
+       const override = expandHomePath(binaryPath?.trim() ?? "", yield* HostProcess.HomeDirectory);
++      if (options.externalOnly) {
++        const executable = yield* findVerifiedExternal(
++          yield* commandCandidates(override || "agy", processEnvironment),
++          override ? "override" : "path",
++        );
++        if (executable !== null) return executable;
++        return yield* installationError(
++          "resolve",
++          "Install the official Antigravity CLI separately and set its executable path in provider settings.",
++        );
++      }
+       if (override) {
+         const external = yield* findVerifiedExternal(
+           yield* commandCandidates(override, processEnvironment),
+@@ -1223,7 +1230,7 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
+   const refreshRelease = Effect.fn("AntigravityInstallation.refreshRelease")(function* (
+     explicit = false,
+   ) {
+-    if (options.releaseAsset !== undefined || !supported) return;
++    if (options.externalOnly || options.releaseAsset !== undefined || !supported) return;
+     if (!explicit && !(yield* options.updateChecksEnabled ?? Effect.succeed(true))) return;
+     const now = yield* Clock.currentTimeMillis;
+     if (!explicit && lastUpdateCheck !== undefined && now - lastUpdateCheck < UPDATE_CHECK_INTERVAL)
+@@ -1266,6 +1273,12 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
+   });
+ 
+   const start = Effect.gen(function* () {
++    if (options.externalOnly) {
++      return yield* installationError(
++        "start",
++        "Install the official Antigravity CLI separately and set its executable path in provider settings.",
++      );
++    }
+     const current = yield* SubscriptionRef.get(state);
+     if (isRunning(current)) return current;
+     yield* refreshRelease(true);
+diff --git a/apps/server/src/provider/Drivers/AntigravityDriver.ts b/apps/server/src/provider/Drivers/AntigravityDriver.ts
+index fa1c5fffa3..f2311cda9a 100644
+--- a/apps/server/src/provider/Drivers/AntigravityDriver.ts
++++ b/apps/server/src/provider/Drivers/AntigravityDriver.ts
+@@ -27,7 +27,6 @@ import * as Scope from "effect/Scope";
+ import * as Stream from "effect/Stream";
+ import * as ChildProcess from "effect/process/ChildProcess";
+ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+-import { HttpClient } from "effect/http";
+ import * as AcpErrors from "effect-acp/errors";
+ 
+ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+@@ -71,7 +70,6 @@ import {
+ import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
+ import { ProviderDriverError } from "../Errors.ts";
+ import { makeAntigravityProvider } from "../AntigravityProvider.ts";
+-import { makeAntigravityUsageProbe } from "../antigravityUsageLimits.ts";
+ import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+ import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
+ import {
+@@ -115,7 +113,6 @@ export type AntigravityDriverEnv =
+   | Digest.Digest
+   | SecureRandom.SecureRandom
+   | FileSystem.FileSystem
+-  | HttpClient.HttpClient
+   | IdAllocator.IdAllocatorV2
+   | McpProviderSessions.McpProviderSessions
+   | ModelCatalog.ModelCatalog
+@@ -143,7 +140,6 @@ export const AntigravityDriver: ProviderDriver<
+     const digest = yield* Digest.Digest;
+     const random = yield* SecureRandom.SecureRandom;
+     const fileSystem = yield* FileSystem.FileSystem;
+-    const httpClient = yield* HttpClient.HttpClient;
+     const path = yield* Path.Path;
+     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+     const host = yield* ProviderHost.ProviderHost;
+@@ -576,21 +572,10 @@ export const AntigravityDriver: ProviderDriver<
+       };
+     });
+ 
+-    const usage = yield* makeAntigravityUsageProbe({
+-      profileDirectory,
+-      authMethod: auth.authMethod,
+-    }).pipe(
+-      Effect.provideService(FileSystem.FileSystem, fileSystem),
+-      Effect.provideService(Path.Path, path),
+-      Effect.provideService(Digest.Digest, digest),
+-      Effect.provideService(HttpClient.HttpClient, httpClient),
+-    );
+     const provider = yield* makeAntigravityProvider(settings, {
+       environment: processEnvironment,
+       stampIdentity: classifyModels,
+       probe,
+-      probeUsage: usage.probe,
+-      clearUsage: usage.clear,
+       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
+       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
+       rememberRuntimeModes: (modes) =>
+diff --git a/apps/server/src/usage/cliproxyApi.test.ts b/apps/server/src/usage/cliproxyApi.test.ts
+index 56983c0684..f2b1d6012c 100644
+--- a/apps/server/src/usage/cliproxyApi.test.ts
++++ b/apps/server/src/usage/cliproxyApi.test.ts
+@@ -1,5 +1,4 @@
+ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+-import * as HostProcess from "@t3tools/shared/HostProcess";
+ import { describe, expect, it } from "@effect/vitest";
+ import * as Effect from "effect/Effect";
+ import * as Schema from "effect/Schema";
+@@ -55,7 +54,6 @@ function fixture(
+       provider: string;
+       email?: string;
+       disabled?: boolean;
+-      project_id?: string;
+       id_token?: { chatgpt_account_id: string; plan_type?: string; chatgpt_plan_type?: string };
+     }>;
+     upstream?: (request: RequestBody) => { status: number; body: unknown };
+@@ -485,17 +483,6 @@ describe("CLIProxyAPI built-in management API", () => {
+     }),
+   );
+ 
+-  const antigravitySummary = {
+-    buckets: [
+-      {
+-        bucketId: "gemini-weekly",
+-        window: "weekly",
+-        remainingFraction: 0.75,
+-        resetTime: "2099-01-01T00:00:00Z",
+-      },
+-    ],
+-  };
+-
+   it.effect("reads an xAI account as Grok with Grok CLI headers", () =>
+     Effect.gen(function* () {
+       const test = fixture({
+@@ -526,105 +513,23 @@ describe("CLIProxyAPI built-in management API", () => {
+     }),
+   );
+ 
+-  it.effect("reads an Antigravity summary and keys the account by its Google ID", () =>
++  it.effect("does not send quota or model requests for Antigravity accounts", () =>
+     Effect.gen(function* () {
+       const test = fixture({
+-        accounts: [
+-          {
+-            id: "antigravity-g@example.com.json",
+-            auth_index: "g",
+-            provider: "antigravity",
+-            email: "g@example.com",
+-            project_id: "project-7",
+-          },
+-        ],
+-        upstream: (request) => ({
+-          status: 200,
+-          body: request.url?.endsWith("/userinfo") ? { id: "google-42" } : antigravitySummary,
+-        }),
++        accounts: [{ id: "antigravity.json", auth_index: "g", provider: "antigravity" }],
+       });
+-      const [account] = yield* (yield* test.api).readAccounts(config);
+-      expect(account?.driver).toBe("antigravity");
+-      expect(account?.email).toBeUndefined();
+-      expect(account?.usageLimits.credentialFingerprint).toBe(
+-        // sha256("google-account\0google-42"), as a local Antigravity probe reports it.
+-        "136d4952771fd67a3600053f37492cbd05828712e0b1c89ebab03d4c22ab6554",
+-      );
+-      expect(account?.usageLimits.windows).toMatchObject([
+-        { id: "gemini-weekly", kind: "weekly", usedPercent: 25 },
+-      ]);
+-      const summary = test.requests.find((request) => request.body?.method === "POST")?.body;
+-      expect(summary?.url).toBe(
+-        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+-      );
+-      expect(summary?.data).toBe(encodeJson({ project: "project-7" }));
+-      expect(summary).toMatchObject({
+-        auth_index: "g",
+-        method: "POST",
+-        header: {
+-          Authorization: "Bearer $TOKEN$",
+-          "Content-Type": "application/json",
+-          "User-Agent":
+-            "antigravity/hub/2.24.0 (aidev_client; os_type=linux; arch=x64; cl=963137146)",
+-        },
+-      });
+-      const identityCalls = test.requests.filter((request) =>
+-        request.body?.url?.endsWith("/userinfo"),
+-      );
+-      expect(identityCalls).toHaveLength(1);
+-      expect(identityCalls[0]?.body).toMatchObject({
+-        method: "GET",
+-        url: "https://www.googleapis.com/oauth2/v2/userinfo",
+-        header: { Authorization: "Bearer $TOKEN$" },
+-      });
+-    }).pipe(
+-      Effect.provideService(HostProcess.Platform, "linux"),
+-      Effect.provideService(HostProcess.Architecture, "x64"),
+-    ),
+-  );
+-
+-  it.effect("keeps Antigravity limits and listing email when its identity read fails", () =>
+-    Effect.gen(function* () {
+-      const test = fixture({
+-        accounts: [
+-          {
+-            id: "antigravity.json",
+-            auth_index: "g",
+-            provider: "antigravity",
+-            email: "g@example.com",
+-            project_id: "project-7",
+-          },
+-        ],
+-        upstream: (request) =>
+-          request.url?.endsWith("/userinfo")
+-            ? { status: 403, body: { error: "denied" } }
+-            : {
+-                status: 200,
+-                body: antigravitySummary,
+-              },
+-      });
+-      const result = yield* (yield* test.api).readAccounts(config);
+-      expect(result).toHaveLength(1);
+-      const [account] = result;
+-      expect(account).toMatchObject({ driver: "antigravity", email: "g@example.com" });
+-      expect(account?.usageLimits.credentialFingerprint).toBeUndefined();
+-      expect(account?.usageLimits.unavailable).toBeUndefined();
+-      expect(account?.usageLimits.windows).toMatchObject([
+-        { id: "gemini-weekly", kind: "weekly", usedPercent: 25 },
+-      ]);
++      expect(yield* (yield* test.api).readAccounts(config)).toEqual([]);
++      expect(test.requests.map((request) => request.path)).toEqual(["/v0/management/auth-files"]);
+     }),
+   );
+ 
+   it.effect.each([
+     { name: "a refused xAI call", provider: "xai", status: 403, body: { error: "denied" } },
+     { name: "a malformed xAI answer", provider: "xai", status: 200, body: { config: "x" } },
+-    { name: "a refused Antigravity call", provider: "antigravity", status: 401, body: {} },
+-    { name: "a malformed Antigravity answer", provider: "antigravity", status: 200, body: [] },
+-    { name: "an empty Antigravity summary", provider: "antigravity", status: 200, body: {} },
+   ])("reports $name as unreadable", ({ provider, status, body }) =>
+     Effect.gen(function* () {
+       const test = fixture({
+-        accounts: [{ id: `${provider}.json`, auth_index: "a", provider, project_id: "project-7" }],
++        accounts: [{ id: `${provider}.json`, auth_index: "a", provider }],
+         upstream: () => ({ status, body }),
+       });
+       const [account] = yield* (yield* test.api).readAccounts(config);
+@@ -632,28 +537,6 @@ describe("CLIProxyAPI built-in management API", () => {
+     }),
+   );
+ 
+-  it.effect.each([undefined, "", "  "])(
+-    "rejects a missing or blank Antigravity project (%s) before upstream calls",
+-    (project_id) =>
+-      Effect.gen(function* () {
+-        const test = fixture({
+-          accounts: [
+-            {
+-              id: "antigravity.json",
+-              auth_index: "a",
+-              provider: "antigravity",
+-              ...(project_id === undefined ? {} : { project_id }),
+-            },
+-          ],
+-        });
+-        const [account] = yield* (yield* test.api).readAccounts(config);
+-        expect(account?.usageLimits.unavailable?.reason).toBe("probeFailed");
+-        expect(test.requests.map((request) => request.path)).not.toContain(
+-          "/v0/management/api-call",
+-        );
+-      }),
+-  );
+-
+   it.effect("skips accounts of providers the hub table does not know", () =>
+     Effect.gen(function* () {
+       const test = fixture({
+diff --git a/apps/server/src/usage/cliproxyApi.ts b/apps/server/src/usage/cliproxyApi.ts
+index af80091c3e..bfed96e5fa 100644
+--- a/apps/server/src/usage/cliproxyApi.ts
++++ b/apps/server/src/usage/cliproxyApi.ts
+@@ -5,7 +5,6 @@ import {
+   type UsageLimitSourceAccount,
+   type UsageLimitSourceConfig,
+ } from "@t3tools/contracts";
+-import * as HostProcess from "@t3tools/shared/HostProcess";
+ import * as Cause from "effect/Cause";
+ import * as Digest from "effect/crypto/Digest";
+ import * as DateTime from "effect/DateTime";
+@@ -23,11 +22,6 @@ import {
+ import { codexPlanLabel } from "../provider/CodexProvider.ts";
+ import { codexRateLimitsToLimits } from "../provider/codexUsageLimits.ts";
+ import { claudeUsageResponseToLimits } from "../provider/claudeUsageLimits.ts";
+-import {
+-  antigravityAccountFingerprint,
+-  antigravitySummaryWindows,
+-  antigravityUserAgent,
+-} from "../provider/antigravityUsageLimits.ts";
+ import {
+   makeUnavailableUsageLimits,
+   makeUsageLimits,
+@@ -45,7 +39,6 @@ const AuthFile = Schema.Struct({
+   provider: Schema.String,
+   email: Schema.optional(Schema.String),
+   disabled: Schema.optional(Schema.Boolean),
+-  project_id: Schema.optional(Schema.String),
+   id_token: Schema.optional(
+     Schema.Struct({
+       chatgpt_account_id: Schema.optional(Schema.String),
+@@ -206,11 +199,7 @@ type HubCall = (
+ type HubReading = Omit<UsageLimitSourceAccount, "id" | "driver">;
+ interface HubProvider {
+   readonly driver: ProviderDriverKind;
+-  readonly header: (
+-    account: AuthFile,
+-    platform: NodeJS.Platform,
+-    architecture: NodeJS.Architecture,
+-  ) => Record<string, string>;
++  readonly header: (account: AuthFile) => Record<string, string>;
+   readonly read: (input: {
+     readonly account: AuthFile;
+     readonly call: HubCall;
+@@ -296,8 +285,6 @@ const CODEX_HUB: HubProvider = {
+ };
+ 
+ const GROK_CLI_VERSION = "1.0.77";
+-const ANTIGRAVITY_SUMMARY_URL =
+-  "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+ 
+ // Keyed by the auth-files `provider`; accounts of any other provider are skipped.
+ const HUB_PROVIDERS = new Map<string, HubProvider>([
+@@ -364,49 +351,11 @@ const HUB_PROVIDERS = new Map<string, HubProvider>([
+       }),
+     },
+   ],
+-  [
+-    "antigravity",
+-    {
+-      driver: ProviderDriverKind.make("antigravity"),
+-      header: (_account, platform, architecture) => ({
+-        Authorization: "Bearer $TOKEN$",
+-        "Content-Type": "application/json",
+-        "User-Agent": antigravityUserAgent(platform, architecture),
+-      }),
+-      read: Effect.fnUntraced(function* ({ account, call, checkedAt }) {
+-        const project = account.project_id?.trim();
+-        if (!project) {
+-          return yield* new UsageLimitSourceError({ detail: "No Antigravity project reported." });
+-        }
+-        const requestedAt = DateTime.toEpochMillis(yield* DateTime.now);
+-        const summary = yield* call(ANTIGRAVITY_SUMMARY_URL, { project });
+-        const windows = yield* antigravitySummaryWindows(yield* decodeJson(summary), requestedAt);
+-        if (windows.length === 0) {
+-          return yield* new UsageLimitSourceError({ detail: "No Antigravity quota reported." });
+-        }
+-        // Local Antigravity reports no e-mail, so the Google account fingerprint is what pools the two.
+-        const fingerprint = yield* call("https://www.googleapis.com/oauth2/v2/userinfo").pipe(
+-          Effect.flatMap(decodeJson),
+-          Effect.flatMap(antigravityAccountFingerprint),
+-          Effect.option,
+-        );
+-        const usageLimits = makeUsageLimits({ checkedAt, windows });
+-        return Option.match(fingerprint, {
+-          onNone: () => ({ ...listedIdentity(account), usageLimits }),
+-          onSome: (credentialFingerprint) => ({
+-            usageLimits: { ...usageLimits, credentialFingerprint },
+-          }),
+-        });
+-      }),
+-    },
+-  ],
+ ]);
+ 
+ export const makeCliproxyApi = Effect.gen(function* () {
+   const client = yield* HttpClient.HttpClient;
+   const digest = yield* Digest.Digest;
+-  const platform = yield* HostProcess.Platform;
+-  const architecture = yield* HostProcess.Architecture;
+ 
+   const management = Effect.fn("CliproxyApi.management")(function* (
+     hub: CliproxyHub,
+@@ -486,8 +435,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
+     provider: HubProvider,
+   ) {
+     const checkedAt = DateTime.formatIso(yield* DateTime.now);
+-    const call: HubCall = (url, data) =>
+-      apiCall(hub, account, provider.header(account, platform, architecture), url, data);
++    const call: HubCall = (url, data) => apiCall(hub, account, provider.header(account), url, data);
+     const reading = yield* provider.read({ account, call, checkedAt }).pipe(
+       Effect.provideService(Digest.Digest, digest),
+       Effect.catch((error) =>
+@@ -561,7 +509,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
+       const body = yield* apiCall(
+         hub,
+         account,
+-        CODEX_HUB.header(account, platform, architecture),
++        CODEX_HUB.header(account),
+         `${CREDIT_URL}/consume`,
+         {
+           redeem_request_id: yield* creditRedeemRequestId(

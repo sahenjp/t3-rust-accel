@@ -41,6 +41,14 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(8192)].contains(&0)
 }
 
+/// Render a relative path with forward slashes in JSON output on every OS.
+fn rel_display(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Build a matcher for `--glob *.ts` / `--glob src/**` style patterns.
 /// A bare pattern also matches at any directory depth.
 fn build_globset(pattern: &str) -> Result<GlobSet, String> {
@@ -56,7 +64,7 @@ fn build_globset(pattern: &str) -> Result<GlobSet, String> {
 }
 
 /// Innermost symbol covering `line` (1-based), if any.
-fn enclosing<'a>(syms: &'a [SymMatch], line: usize) -> Option<&'a str> {
+fn enclosing(syms: &[SymMatch], line: usize) -> Option<&str> {
     syms.iter()
         .filter(|s| s.start_line <= line && line <= s.end_line)
         .min_by_key(|s| s.end_line - s.start_line)
@@ -122,8 +130,12 @@ pub fn cmd_grep(
         let name_ok = glob_set
             .as_ref()
             .map(|gs| {
-                gs.is_match(root.file_name().unwrap_or_default().to_string_lossy().as_ref())
-                    || gs.is_match(root)
+                gs.is_match(
+                    root.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .as_ref(),
+                ) || gs.is_match(root)
             })
             .unwrap_or(true);
         if name_ok {
@@ -131,7 +143,7 @@ pub fn cmd_grep(
             let n = search_file(&re, root, &mut hits, max_hits);
             if n > 0 {
                 by_file.insert(path.to_string(), hits);
-                total_hits += n;
+                total_hits = total_hits.saturating_add(n);
                 files_matched += 1;
             }
         }
@@ -160,20 +172,28 @@ pub fn cmd_grep(
             }
             let rel = p.strip_prefix(root).unwrap_or(p);
             if let Some(gs) = &glob_set {
-                if !gs.is_match(rel) && !gs.is_match(name.as_ref()) {
+                let rel_text = rel_display(rel);
+                if !gs.is_match(&rel_text) && !gs.is_match(name.as_ref()) {
                     continue;
                 }
             }
             files.push(p.to_path_buf());
         }
         files.sort();
+        let mut collected_hits = 0usize;
         for f in files {
-            let rel = f.strip_prefix(root).unwrap_or(&f).to_string_lossy().to_string();
+            let rel_path = f.strip_prefix(root).unwrap_or(&f);
+            let rel = rel_display(rel_path);
             let mut hits = Vec::new();
-            let n = search_file(&re, &f, &mut hits, max_hits);
+            // Keep at most max_hits lines across the whole directory walk. The
+            // remaining files are still scanned for totalHits, but their lines
+            // are not accumulated in memory.
+            let hit_cap = max_hits.saturating_sub(collected_hits);
+            let n = search_file(&re, &f, &mut hits, hit_cap);
             if n > 0 {
+                collected_hits = collected_hits.saturating_add(hits.len());
                 by_file.insert(rel, hits);
-                total_hits += n;
+                total_hits = total_hits.saturating_add(n);
                 files_matched += 1;
             }
         }
@@ -205,9 +225,7 @@ pub fn cmd_grep(
             if shown >= max_hits {
                 break 'files;
             }
-            let sym = syms
-                .as_ref()
-                .and_then(|ss| enclosing(ss, *line_no));
+            let sym = syms.as_ref().and_then(|ss| enclosing(ss, *line_no));
             match sym {
                 Some(s) => out.push_str(&format!("L{line_no} [{s}]: {text}\n")),
                 None => out.push_str(&format!("L{line_no}: {text}\n")),

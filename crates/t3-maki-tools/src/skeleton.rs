@@ -9,6 +9,9 @@ use crate::fail;
 
 /// Maki `max_file_size_mb = 2` default.
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Bound recursive AST walks so adversarial deeply nested source cannot
+/// overflow the CLI process stack. Real-world definitions are far shallower.
+const MAX_AST_WALK_DEPTH: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lang {
@@ -112,8 +115,16 @@ pub fn parse(lang: Lang, src: &str) -> Option<tree_sitter::Tree> {
 /// One skeleton entry in source order.
 #[derive(Debug)]
 enum Entry {
-    Import { start: usize, end: usize },
-    Sym { indent: usize, text: String, start: usize, end: usize },
+    Import {
+        start: usize,
+        end: usize,
+    },
+    Sym {
+        indent: usize,
+        text: String,
+        start: usize,
+        end: usize,
+    },
 }
 
 /// What the walker should do with a node.
@@ -134,11 +145,24 @@ fn act(lang: Lang, node: &Node, src: &str) -> Act {
     match lang {
         Lang::Rust => match k {
             "use_declaration" | "extern_crate_declaration" => Act::Import,
-            "function_item" | "function_signature_item" | "const_item" | "static_item"
-            | "type_item" | "associated_type" | "struct_item" | "enum_item" | "union_item"
-            | "macro_definition" | "trait_item" | "impl_item" | "mod_item"
+            "function_item"
+            | "function_signature_item"
+            | "const_item"
+            | "static_item"
+            | "type_item"
+            | "associated_type"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "macro_definition"
+            | "trait_item"
+            | "impl_item"
+            | "mod_item"
             | "foreign_mod_item" => {
-                if matches!(k, "trait_item" | "impl_item" | "mod_item" | "foreign_mod_item") {
+                if matches!(
+                    k,
+                    "trait_item" | "impl_item" | "mod_item" | "foreign_mod_item"
+                ) {
                     if has_body(node) {
                         Act::Container
                     } else {
@@ -153,18 +177,29 @@ fn act(lang: Lang, node: &Node, src: &str) -> Act {
         Lang::TypeScript | Lang::Tsx => match k {
             "import_statement" | "import_alias" => Act::Import,
             "export_statement" | "ambient_declaration" | "module" => Act::Unwrap,
-            "class_declaration" | "abstract_class_declaration" | "interface_declaration"
-            | "enum_declaration" | "internal_module" => {
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "internal_module" => {
                 if has_body(node) {
                     Act::Container
                 } else {
                     Act::Leaf
                 }
             }
-            "function_declaration" | "generator_function_declaration" | "function_signature"
-            | "method_definition" | "abstract_method_signature" | "method_signature"
-            | "property_signature" | "public_field_definition" | "index_signature"
-            | "type_alias_declaration" | "lexical_declaration" | "variable_declaration"
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_signature"
+            | "method_definition"
+            | "abstract_method_signature"
+            | "method_signature"
+            | "property_signature"
+            | "public_field_definition"
+            | "index_signature"
+            | "type_alias_declaration"
+            | "lexical_declaration"
+            | "variable_declaration"
             | "call_signature" => Act::Leaf,
             _ => Act::Skip,
         },
@@ -178,15 +213,18 @@ fn act(lang: Lang, node: &Node, src: &str) -> Act {
                     Act::Leaf
                 }
             }
-            "function_declaration" | "generator_function_declaration" | "method_definition"
-            | "field_definition" | "lexical_declaration" | "variable_declaration"
-            | "method_signature" | "static_block" => Act::Leaf,
+            "function_declaration"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "field_definition"
+            | "lexical_declaration"
+            | "variable_declaration"
+            | "method_signature"
+            | "static_block" => Act::Leaf,
             _ => Act::Skip,
         },
         Lang::Python => match k {
-            "import_statement" | "import_from_statement" | "future_import_statement" => {
-                Act::Import
-            }
+            "import_statement" | "import_from_statement" | "future_import_statement" => Act::Import,
             "decorated_definition" => Act::Unwrap,
             "class_definition" => {
                 if has_body(node) {
@@ -212,8 +250,12 @@ fn act(lang: Lang, node: &Node, src: &str) -> Act {
         },
         Lang::Go => match k {
             "import_declaration" => Act::Import,
-            "package_clause" | "function_declaration" | "method_declaration"
-            | "type_declaration" | "const_declaration" | "var_declaration"
+            "package_clause"
+            | "function_declaration"
+            | "method_declaration"
+            | "type_declaration"
+            | "const_declaration"
+            | "var_declaration"
             | "type_element" => Act::Leaf,
             _ => Act::Skip,
         },
@@ -229,16 +271,17 @@ fn act(lang: Lang, node: &Node, src: &str) -> Act {
                 }
                 _ => Act::Leaf,
             },
-            "function_definition" | "type_definition" | "preproc_function_def" | "preproc_def"
+            "function_definition"
+            | "type_definition"
+            | "preproc_function_def"
+            | "preproc_def"
             | "field_declaration" => Act::Leaf,
             "linkage_specification" => Act::Unwrap,
             _ => Act::Skip,
         },
         Lang::Cpp => match k {
             "preproc_include" => Act::Import,
-            "template_declaration" | "linkage_specification" | "export_statement" => {
-                Act::Unwrap
-            }
+            "template_declaration" | "linkage_specification" | "export_statement" => Act::Unwrap,
             "namespace_definition" => {
                 if has_body(node) {
                     Act::Container
@@ -259,10 +302,17 @@ fn act(lang: Lang, node: &Node, src: &str) -> Act {
                     _ => Act::Leaf,
                 }
             }
-            "function_definition" | "type_definition" | "preproc_function_def"
-            | "preproc_def" | "alias_declaration" | "using_declaration"
-            | "concept_definition" | "field_declaration" | "friend_declaration"
-            | "static_assert_declaration" | "access_specifier" => Act::Leaf,
+            "function_definition"
+            | "type_definition"
+            | "preproc_function_def"
+            | "preproc_def"
+            | "alias_declaration"
+            | "using_declaration"
+            | "concept_definition"
+            | "field_declaration"
+            | "friend_declaration"
+            | "static_assert_declaration"
+            | "access_specifier" => Act::Leaf,
             _ => Act::Skip,
         },
         Lang::Bash => match k {
@@ -366,9 +416,7 @@ pub fn node_name(node: &Node, src: &str) -> Option<String> {
         "impl_item" => node
             .child_by_field_name("type")
             .map(|t| simplify_type(&text_of(&t, src))),
-        "method_declaration" => node
-            .child_by_field_name("name")
-            .map(|n| text_of(&n, src)),
+        "method_declaration" => node.child_by_field_name("name").map(|n| text_of(&n, src)),
         "type_declaration" => node
             .named_child(0)
             .and_then(|s| s.child_by_field_name("name"))
@@ -376,8 +424,7 @@ pub fn node_name(node: &Node, src: &str) -> Option<String> {
         "function_definition" | "declaration" => c_decl_name(*node, src),
         "type_definition" => node
             .child_by_field_name("declarator")
-            .map(|d| declarator_ident(d, src))
-            .flatten(),
+            .and_then(|d| declarator_ident(d, src)),
         "expression_statement" | "assignment" => {
             let a = if node.kind() == "assignment" {
                 *node
@@ -398,14 +445,17 @@ pub fn node_name(node: &Node, src: &str) -> Option<String> {
             .find(|c| c.kind() == "variable_declarator")
             .and_then(|d| d.child_by_field_name("name"))
             .map(|n| text_of(&n, src)),
-        "decorated_definition" | "export_statement" | "template_declaration"
-        | "ambient_declaration" | "module" => node
+        "decorated_definition"
+        | "export_statement"
+        | "template_declaration"
+        | "ambient_declaration"
+        | "module" => node
             .named_children(&mut node.walk())
             .find(|c| !matches!(c.kind(), "decorator" | "export_clause"))
             .and_then(|c| node_name(&c, src)),
-        "declaration_command" | "variable_assignment" => node
-            .named_child(0)
-            .map(|c| text_of(&c, src)),
+        "declaration_command" | "variable_assignment" => {
+            node.named_child(0).map(|c| text_of(&c, src))
+        }
         "namespace_definition" | "internal_module" | "mod_item" => node
             .named_children(&mut node.walk())
             .find(|c| {
@@ -435,9 +485,7 @@ fn simplify_type(t: &str) -> String {
 fn declarator_ident(mut d: Node, src: &str) -> Option<String> {
     loop {
         match d.kind() {
-            "identifier" | "field_identifier" | "type_identifier" => {
-                return Some(text_of(&d, src))
-            }
+            "identifier" | "field_identifier" | "type_identifier" => return Some(text_of(&d, src)),
             "qualified_identifier" | "scoped_identifier" => {
                 if let Some(n) = d.child_by_field_name("name") {
                     return Some(text_of(&n, src));
@@ -460,7 +508,10 @@ fn c_decl_name(node: Node, src: &str) -> Option<String> {
     declarator_ident(d, src)
 }
 
-fn walk(node: &Node, src: &str, lang: Lang, indent: usize, entries: &mut Vec<Entry>) {
+fn walk(node: &Node, src: &str, lang: Lang, indent: usize, depth: usize, entries: &mut Vec<Entry>) {
+    if depth >= MAX_AST_WALK_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match act(lang, &child, src) {
@@ -483,17 +534,19 @@ fn walk(node: &Node, src: &str, lang: Lang, indent: usize, entries: &mut Vec<Ent
                     end: child.end_position().row + 1,
                 });
                 if let Some(body) = body_node(&child) {
-                    walk(&body, src, lang, indent + 1, entries);
+                    walk(&body, src, lang, indent + 1, depth + 1, entries);
                 }
             }
-            Act::Unwrap => walk(&child, src, lang, indent, entries),
+            Act::Unwrap => walk(&child, src, lang, indent, depth + 1, entries),
         }
     }
 }
 
 fn json_skeleton(tree: &tree_sitter::Tree, src: &str, entries: &mut Vec<Entry>) {
     let root = tree.root_node();
-    let Some(doc) = root.named_child(0) else { return };
+    let Some(doc) = root.named_child(0) else {
+        return;
+    };
     match doc.kind() {
         "object" => {
             let mut cursor = doc.walk();
@@ -565,9 +618,11 @@ fn text_outline(lang: Lang, src: &str, entries: &mut Vec<Entry>) {
             }
             Lang::Sql => {
                 let up = l.to_ascii_uppercase();
-                if ["CREATE", "ALTER", "DROP", "INSERT", "SELECT", "WITH", "GRANT", "USE"]
-                    .iter()
-                    .any(|p| up.starts_with(p))
+                if [
+                    "CREATE", "ALTER", "DROP", "INSERT", "SELECT", "WITH", "GRANT", "USE",
+                ]
+                .iter()
+                .any(|p| up.starts_with(p))
                 {
                     (0, l.chars().take(100).collect::<String>())
                 } else {
@@ -576,10 +631,7 @@ fn text_outline(lang: Lang, src: &str, entries: &mut Vec<Entry>) {
             }
             _ => {
                 // Generic: top-level (unindented) non-blank lines.
-                if line.starts_with(' ')
-                    || line.starts_with('\t')
-                    || line.trim().is_empty()
-                {
+                if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
                     continue;
                 }
                 (0, l.chars().take(120).collect::<String>())
@@ -606,16 +658,14 @@ pub struct Skeleton {
     pub truncated: bool,
 }
 
-/// Build the skeleton for `src` parsed as `lang`, capped at `max_lines`.
-pub fn build_skeleton(lang: Lang, src: &str, max_lines: usize) -> Skeleton {
-    let line_count = src.lines().count().max(if src.is_empty() { 0 } else { 1 });
+fn outline_entries(lang: Lang, src: &str) -> Vec<Entry> {
     let mut entries = Vec::new();
     if let Some(tree) = parse(lang, src) {
         if lang == Lang::Json {
             json_skeleton(&tree, src, &mut entries);
         } else {
             let root = tree.root_node();
-            walk(&root, src, lang, 0, &mut entries);
+            walk(&root, src, lang, 0, 0, &mut entries);
         }
     }
     if entries.is_empty() && !lang.is_tree_sitter() {
@@ -623,7 +673,20 @@ pub fn build_skeleton(lang: Lang, src: &str, max_lines: usize) -> Skeleton {
         // never fail on .md/.toml/.yaml/.sql.
         text_outline(lang, src, &mut entries);
     }
+    entries
+}
 
+pub(crate) fn count_symbols(lang: Lang, src: &str) -> usize {
+    outline_entries(lang, src)
+        .into_iter()
+        .filter(|entry| matches!(entry, Entry::Sym { .. }))
+        .count()
+}
+
+/// Build the skeleton for `src` parsed as `lang`, capped at `max_lines`.
+pub fn build_skeleton(lang: Lang, src: &str, max_lines: usize) -> Skeleton {
+    let line_count = src.lines().count();
+    let entries = outline_entries(lang, src);
     let mut lines: Vec<String> = Vec::new();
     let mut symbol_count = 0usize;
     let mut pending_imports: Option<(usize, usize, usize)> = None; // start, end, count
@@ -646,7 +709,12 @@ pub fn build_skeleton(lang: Lang, src: &str, max_lines: usize) -> Skeleton {
                 }
                 None => pending_imports = Some((start, end, 1)),
             },
-            Entry::Sym { indent, text, start, end } => {
+            Entry::Sym {
+                indent,
+                text,
+                start,
+                end,
+            } => {
                 flush_imports(&mut lines, &mut pending_imports);
                 symbol_count += 1;
                 let pad = "  ".repeat(indent.min(6));
@@ -698,7 +766,10 @@ fn container_name(lang: Lang, node: &Node, src: &str) -> Option<String> {
                 | "class"
         ),
         Lang::Python => matches!(k, "class_definition"),
-        Lang::Cpp => matches!(k, "namespace_definition" | "class_specifier" | "union_specifier"),
+        Lang::Cpp => matches!(
+            k,
+            "namespace_definition" | "class_specifier" | "union_specifier"
+        ),
         Lang::C => matches!(k, "struct_specifier" | "enum_specifier"),
         _ => false,
     };
@@ -710,7 +781,9 @@ fn container_name(lang: Lang, node: &Node, src: &str) -> Option<String> {
 }
 
 fn push_match(n: &Node, src: &str, ancestors: &[String], out: &mut Vec<SymMatch>) {
-    let Some(mut name) = node_name(n, src) else { return };
+    let Some(mut name) = node_name(n, src) else {
+        return;
+    };
     if name.is_empty() {
         return;
     }
@@ -718,10 +791,7 @@ fn push_match(n: &Node, src: &str, ancestors: &[String], out: &mut Vec<SymMatch>
     let qualified = if n.kind() == "method_declaration" {
         let recv = n
             .child_by_field_name("receiver")
-            .and_then(|r| {
-                r.named_child(0)
-                    .and_then(|p| p.child_by_field_name("type"))
-            })
+            .and_then(|r| r.named_child(0).and_then(|p| p.child_by_field_name("type")))
             .map(|t| simplify_type(&text_of(&t, src)))
             .unwrap_or_default();
         if recv.is_empty() {
@@ -752,7 +822,17 @@ fn push_match(n: &Node, src: &str, ancestors: &[String], out: &mut Vec<SymMatch>
 }
 
 /// Recursive walk collecting every named definition-like node.
-fn collect(node: &Node, src: &str, lang: Lang, ancestors: &[String], out: &mut Vec<SymMatch>) {
+fn collect(
+    node: &Node,
+    src: &str,
+    lang: Lang,
+    ancestors: &[String],
+    depth: usize,
+    out: &mut Vec<SymMatch>,
+) {
+    if depth >= MAX_AST_WALK_DEPTH {
+        return;
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let a = act(lang, &child, src);
@@ -788,15 +868,14 @@ fn collect(node: &Node, src: &str, lang: Lang, ancestors: &[String], out: &mut V
         } else {
             ancestors
         };
-        collect(&child, src, lang, anc, out);
+        collect(&child, src, lang, anc, depth + 1, out);
     }
 }
 
 /// Include leading attribute/decorator siblings directly above the node.
 fn extend_start<'a>(node: Node<'a>) -> Node<'a> {
     let mut n = node;
-    loop {
-        let Some(prev) = n.prev_named_sibling() else { break };
+    while let Some(prev) = n.prev_named_sibling() {
         let adjacent = prev.end_position().row + 1 >= n.start_position().row;
         if !adjacent
             || !matches!(
@@ -818,7 +897,7 @@ pub fn all_symbols(lang: Lang, src: &str) -> Vec<SymMatch> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    collect(&tree.root_node(), src, lang, &[], &mut out);
+    collect(&tree.root_node(), src, lang, &[], 0, &mut out);
     out
 }
 
@@ -827,7 +906,7 @@ pub fn find_symbols(lang: Lang, src: &str, query: &str) -> Vec<SymMatch> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    collect(&tree.root_node(), src, lang, &[], &mut out);
+    collect(&tree.root_node(), src, lang, &[], 0, &mut out);
     let q = query.replace('.', "::");
     let bare = !q.contains("::");
     out.into_iter()
@@ -843,9 +922,9 @@ pub fn find_symbols(lang: Lang, src: &str, query: &str) -> Vec<SymMatch> {
 
 /// Read a file, refusing > 2 MiB (Maki max_file_size_mb default).
 pub fn read_source(path: &Path) -> Result<String, Value> {
-    let meta = std::fs::metadata(path).map_err(|e| {
-        json!({"ok": false, "error": format!("cannot stat {}: {e}", path.display())})
-    })?;
+    let meta = std::fs::metadata(path).map_err(
+        |e| json!({"ok": false, "error": format!("cannot stat {}: {e}", path.display())}),
+    )?;
     if meta.is_dir() {
         return Err(json!({"ok": false, "error": format!("{} is a directory", path.display())}));
     }
@@ -854,9 +933,8 @@ pub fn read_source(path: &Path) -> Result<String, Value> {
             "{} exceeds the 2 MiB limit ({} bytes)", path.display(), meta.len()
         )}));
     }
-    std::fs::read_to_string(path).map_err(|e| {
-        json!({"ok": false, "error": format!("cannot read {}: {e}", path.display())})
-    })
+    std::fs::read_to_string(path)
+        .map_err(|e| json!({"ok": false, "error": format!("cannot read {}: {e}", path.display())}))
 }
 
 pub fn die(v: Value) -> ! {
