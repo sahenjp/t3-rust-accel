@@ -28,19 +28,17 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        if: matrix.artifact == 't3-rust-accel-linux-x64'
-        with:
-          repository: pingdotgg/t3code
-          ref: 4e6b1fa7710515cee652370b534e041a372648ea
-          path: upstream
-          persist-credentials: false
       - name: Check the T3 Code patch stack against upstream
         if: matrix.artifact == 't3-rust-accel-linux-x64'
         shell: bash
         run: |
+          upstream="$RUNNER_TEMP/t3-upstream"
+          git init --quiet "$upstream"
+          git -C "$upstream" fetch --depth=1 https://github.com/pingdotgg/t3code.git \
+            4e6b1fa7710515cee652370b534e041a372648ea
+          git -C "$upstream" checkout --quiet --detach FETCH_HEAD
           for patch in patches/000*.patch; do
-            git -C upstream apply --whitespace=error-all "$PWD/$patch"
+            git -C "$upstream" apply --whitespace=error-all "$PWD/$patch"
           done
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         if: runner.os != 'Linux'
@@ -59,6 +57,7 @@ jobs:
         if: runner.os != 'Linux'
         shell: bash
         run: |
+          rustup toolchain install 1.100.0 --profile minimal --component clippy
           rustup default 1.100.0
           bash scripts/verify-package.sh
       - name: Boot the packaged tools on Debian 12 and 13 without network access
