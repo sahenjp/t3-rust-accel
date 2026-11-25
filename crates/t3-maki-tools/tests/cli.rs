@@ -1039,6 +1039,22 @@ fn exec_huge_output_still_preserves_tail() {
     );
 }
 
+#[test]
+fn exec_allows_multithreaded_python_pool_within_virtual_memory_limit() {
+    let dir = tmpdir("exec_threads");
+    // 48 concurrent threads reserve 384 MiB of default 8 MiB Linux thread stacks
+    // plus glibc arenas and interpreter mappings (>512 MiB VSZ, <15 MiB RSS).
+    let script = b"from concurrent.futures import ThreadPoolExecutor\nimport threading\nb = threading.Barrier(48, timeout=5)\nwith ThreadPoolExecutor(max_workers=48) as ex:\n    futs = [ex.submit(lambda i: (b.wait(), i)[1], i) for i in range(48)]\n    print('SUM', sum(f.result() for f in futs))\n";
+    let (v, _) = run(&["exec", "--cwd", dir.to_str().unwrap()], script);
+    let v = ok(&v);
+    assert_eq!(v["exitCode"], 0, "{}", v["stderr"]);
+    assert!(
+        v["stdout"].as_str().unwrap().contains("SUM 1128"),
+        "{}",
+        v["stdout"]
+    );
+}
+
 // ---------------- econ ----------------
 
 #[test]

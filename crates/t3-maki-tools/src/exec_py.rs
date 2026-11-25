@@ -23,6 +23,10 @@ const MAX_TIMEOUT_MS: u64 = 30_000;
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(not(target_os = "macos"))]
 const PROCESS_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+// Linux RLIMIT_AS caps virtual address space (VSZ), including thread stacks,
+// shared libraries, and allocator arenas rather than resident memory alone.
+#[cfg(all(unix, not(target_os = "macos")))]
+const UNIX_RLIMIT_AS_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[cfg(unix)]
 const RLIMIT_CPU_SECS: u64 = 15;
 #[cfg(unix)]
@@ -215,6 +219,11 @@ fn apply_sanitized_env(cmd: &mut Command, exe: &PathBuf) {
     }
 
     cmd.env_clear();
+    // Bound glibc per-thread malloc arenas and BLAS/OpenMP thread pools by default
+    // so virtual address reservations stay compact under RLIMIT_AS.
+    cmd.env("MALLOC_ARENA_MAX", "2")
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1");
     for (key, value) in inherited {
         cmd.env(key, value);
     }
@@ -242,8 +251,11 @@ fn configure_platform_child(cmd: &mut Command) {
             };
             // Darwin rejects this limit when the child's existing address map
             // already exceeds it, before Python can start.
-            #[cfg(not(target_os = "macos"))]
-            set_limit(libc::RLIMIT_AS, PROCESS_MEMORY_BYTES as _)?;
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                set_limit(libc::RLIMIT_DATA, PROCESS_MEMORY_BYTES as _)?;
+                set_limit(libc::RLIMIT_AS, UNIX_RLIMIT_AS_BYTES as _)?;
+            }
             set_limit(libc::RLIMIT_CPU, RLIMIT_CPU_SECS as _)?;
             set_limit(libc::RLIMIT_FSIZE, RLIMIT_FSIZE_BYTES as _)?;
             Ok(())

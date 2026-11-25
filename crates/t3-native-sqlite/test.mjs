@@ -287,6 +287,31 @@ test("checkpoint worker flushes a write below the notification threshold after i
   }
 });
 
+test("PRAGMA incremental_vacuum(1) reclaims free pages without ExecuteReturnedResults error", async () => {
+  const vacuumFile = join(dir, "incremental-vacuum.sqlite");
+  const w = await NativeSqliteWorker.open({
+    filename: vacuumFile,
+    readOnly: false,
+    requireWal: false,
+  });
+  try {
+    await exec(w, "PRAGMA auto_vacuum = INCREMENTAL", { cached: false });
+    await exec(w, "PRAGMA journal_mode = WAL", { cached: false });
+    await exec(w, "CREATE TABLE vac(data BLOB NOT NULL)", { cached: false });
+    await exec(w, "INSERT INTO vac VALUES (randomblob(65536))");
+    await exec(w, "DELETE FROM vac");
+    const [before] = await exec(w, "PRAGMA freelist_count");
+    assert(before.freelist_count > 0, `expected free pages, got ${before.freelist_count}`);
+    for (let i = 0; i < before.freelist_count; i++) {
+      assert.deepEqual(await exec(w, "PRAGMA incremental_vacuum(1)"), []);
+    }
+    const [after] = await exec(w, "PRAGMA freelist_count");
+    assert.equal(after.freelist_count, 0);
+  } finally {
+    await w.close();
+  }
+});
+
 test("execute after close rejects; close() is graceful", async () => {
   const w = await NativeSqliteWorker.open({ filename: dbFile, readOnly: true, requireWal: true });
   const closing = w.close();

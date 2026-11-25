@@ -542,7 +542,13 @@ fn run_statement(
       safe: req.safe_integers,
     })
   } else {
-    stmt.raw_execute().map_err(exec_err)?;
+    // Statements with zero result columns (such as PRAGMA incremental_vacuum)
+    // can still yield SQLITE_ROW on step; node:sqlite's StatementSync::run()
+    // steps once, resets, and treats both SQLITE_DONE and SQLITE_ROW as success.
+    match stmt.raw_execute() {
+      Ok(_) | Err(rusqlite::Error::ExecuteReturnedResults) => {}
+      Err(err) => return Err(exec_err(err)),
+    }
     if req.raw {
       Ok(QueryResult::Raw {
         changes: conn.changes() as i64,

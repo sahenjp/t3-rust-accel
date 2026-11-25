@@ -2667,6 +2667,104 @@ index 54b521c474..5fc1b4f41b 100644
            messages: selected.messages,
            coverage,
            omittedItems: selected.omittedItems,
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
+index e6652c5963..7145355d50 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
+@@ -2105,11 +2105,17 @@ it.effect(
+ );
+ 
+ it.effect.each([
+-  { resume: "native resume", supportsNativeResume: true, minutes: 2 },
+-  { resume: "no native resume", supportsNativeResume: false, minutes: 30 },
++  { resume: "native resume", supportsNativeResume: true, subagent: false, minutes: 2 },
++  { resume: "no native resume", supportsNativeResume: false, subagent: false, minutes: 30 },
++  {
++    resume: "no native resume for subagent",
++    supportsNativeResume: false,
++    subagent: true,
++    minutes: 2,
++  },
+ ])(
+   "ProviderSessionManagerV2 releases an idle session with $resume after $minutes minutes",
+-  ({ supportsNativeResume, minutes }) =>
++  ({ supportsNativeResume, subagent, minutes }) =>
+     Effect.gen(function* () {
+       const state = yield* Ref.make(emptyState);
+       const capabilities = {
+@@ -2127,7 +2133,12 @@ it.effect.each([
+         });
+         yield* eventSink.write({
+           events: [
+-            yield* makeThreadCreatedEvent({ idAllocator, threadId, now: yield* DateTime.now }),
++            yield* makeThreadCreatedEvent({
++              idAllocator,
++              threadId,
++              now: yield* DateTime.now,
++              ...(subagent ? { delegatedBy: ThreadId.make("thread-parent") } : {}),
++            }),
+           ],
+         });
+         yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+index 291ac02272..20c708ca29 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+@@ -578,14 +578,33 @@ export const layerWithOptions = (
+         readonly providerSessionId: ProviderSessionId;
+         readonly threadId: ThreadId;
+       }) => `${input.providerSessionId}\u0000${input.threadId}`;
+-      const idleTimeoutFor = (runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime) =>
++      const isSubagentThread = (threadId: ThreadId) =>
++        projectionStore.getThread(threadId).pipe(
++          Effect.map((thread) => thread.lineage.relationshipToParent === "subagent"),
++          Effect.orElseSucceed(() => false),
++        );
++      const idleTimeoutFor = (
++        runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
++        subagentOnly = false,
++      ) =>
+         Math.max(
+           1,
+           options.idleTimeoutMs ??
+-            (runtime.providerSession.capabilities.turns.supportsNativeResume === true
++            (runtime.providerSession.capabilities.turns.supportsNativeResume === true ||
++            subagentOnly
+               ? DEFAULT_IDLE_TIMEOUT_MS
+               : NO_NATIVE_RESUME_IDLE_TIMEOUT_MS),
+         );
++      const idleTimeoutForEntry = (
++        entry: Pick<LiveSessionEntry, "runtime" | "attachedThreadIds">,
++      ) =>
++        options.idleTimeoutMs !== undefined ||
++        entry.runtime.providerSession.capabilities.turns.supportsNativeResume === true ||
++        entry.attachedThreadIds.size === 0
++          ? Effect.succeed(idleTimeoutFor(entry.runtime))
++          : Effect.forEach(entry.attachedThreadIds, isSubagentThread).pipe(
++              Effect.map((flags) => idleTimeoutFor(entry.runtime, flags.every(Boolean))),
++            );
+       const maxIdlePinMs = Math.max(0, options.maxIdlePinMs ?? DEFAULT_MAX_IDLE_PIN_MS);
+       interface PreparedMcpCredential {
+         readonly mcpCredentialId: string | undefined;
+@@ -1697,7 +1716,7 @@ export const layerWithOptions = (
+                 pinnedForMs: now - pinnedSinceMs,
+               });
+               // Recheck on this fiber; scheduleIdleReleaseInternal would interrupt it and self-deadlock.
+-              yield* Effect.sleep(Duration.millis(idleTimeoutFor(probedRuntime)));
++              yield* Effect.sleep(Duration.millis(yield* idleTimeoutForEntry(entry)));
+               return yield* releaseIfStillIdle(input);
+             }
+             yield* Effect.logWarning("orchestration-v2.driver-session.idle-release-pin-expired", {
+@@ -1767,7 +1786,8 @@ export const layerWithOptions = (
+ 
+         yield* cancelIdleFiber(entry.idleFiber);
+         const generation = entry.idleGeneration + 1;
+-        const idleFiber = yield* Effect.sleep(Duration.millis(idleTimeoutFor(entry.runtime))).pipe(
++        const idleTimeoutMs = yield* idleTimeoutForEntry(entry);
++        const idleFiber = yield* Effect.sleep(Duration.millis(idleTimeoutMs)).pipe(
+           Effect.andThen(releaseIfStillIdle({ providerSessionId, generation })),
+           Effect.forkIn(layerScope),
+         );
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 index 8051a41290..61be77683b 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
@@ -3147,15 +3245,15 @@ index 6711fbd3f5..5d07849560 100644
      Effect.callback<
        {
 diff --git a/apps/server/vite.config.ts b/apps/server/vite.config.ts
-index 2bec8830d8..a330d50f5e 100644
+index 2bec8830d8..08bab0b86e 100644
 --- a/apps/server/vite.config.ts
 +++ b/apps/server/vite.config.ts
 @@ -34,6 +34,8 @@ if (!TELEMETRY_CHANNELS.includes(telemetryChannel)) {
    );
  }
  
-+// T3_SLIM_BUILD=1 emits a minified, sourcemap-free dist for memory-constrained hosts.
-+const slimBuild = process.env.T3_SLIM_BUILD === "1";
++// Emit a minified, sourcemap-free dist by default for memory-constrained hosts (T3_SLIM_BUILD=0 opts out).
++const slimBuild = process.env.T3_SLIM_BUILD !== "0";
  // tsdown SEA needs one chunk (sourcemaps count) and Node >=25.7, so package separately.
  // "bundle" emits the embedded CLI. "1" builds dist-exe/t3 from the bootstrap.
  // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
