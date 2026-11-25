@@ -27,10 +27,12 @@ index 0d4e26b380..6e2b16cc9b 100644
      Option.fromUndefinedOr(env.host),
 diff --git a/apps/server/src/mcp/MakiMcpService.ts b/apps/server/src/mcp/MakiMcpService.ts
 new file mode 100644
-index 0000000000..9fcf50cfb5
+index 0000000000..70fdacd51e
 --- /dev/null
 +++ b/apps/server/src/mcp/MakiMcpService.ts
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,112 @@
++import * as NodePath from "node:path";
++
 +import { OrchestratorMcpFailure } from "@t3tools/contracts";
 +import * as Context from "effect/Context";
 +import * as Effect from "effect/Effect";
@@ -41,8 +43,6 @@ index 0000000000..9fcf50cfb5
 +import { ChildProcess, ChildProcessSpawner } from "effect/process";
 +
 +const DEFAULT_BIN = "t3-maki-tools";
-+
-+const makiToolsBin = () => process.env.T3_MAKI_TOOLS_BIN ?? DEFAULT_BIN;
 +
 +const decodeJsonOutput = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 +
@@ -77,26 +77,62 @@ index 0000000000..9fcf50cfb5
 +  Effect.gen(function* () {
 +    const fileSystem = yield* FileSystem.FileSystem;
 +    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-+    const bin = makiToolsBin();
++    const configured = (process.env.T3_MAKI_TOOLS_BIN ?? DEFAULT_BIN).trim();
 +    const encoder = new TextEncoder();
 +
-+    const available = fileSystem.exists(bin).pipe(Effect.orElseSucceed(() => false));
++    const statFile = (candidate: string, requireExecutable: boolean) =>
++      fileSystem.stat(candidate).pipe(
++        Effect.map(
++          (info) => info.type === "File" && (!requireExecutable || (info.mode & 0o111) !== 0),
++        ),
++        Effect.orElseSucceed(() => false),
++      );
++    const resolveBinary = Effect.fnUntraced(function* () {
++      if (
++        configured.includes("/") ||
++        configured.includes("\\") ||
++        NodePath.isAbsolute(configured)
++      ) {
++        const resolved = NodePath.resolve(configured);
++        return (yield* statFile(resolved, false)) ? resolved : undefined;
++      }
++      if (configured === "") return undefined;
++      const names =
++        process.platform === "win32"
++          ? [configured, `${configured}.exe`, `${configured}.com`]
++          : [configured];
++      for (const entry of (process.env.PATH ?? "").split(
++        process.platform === "win32" ? ";" : ":",
++      )) {
++        if (!NodePath.isAbsolute(entry)) continue;
++        for (const name of names) {
++          const candidate = NodePath.join(entry, name);
++          if (yield* statFile(candidate, process.platform !== "win32")) return candidate;
++        }
++      }
++      return undefined;
++    });
++
++    const available = resolveBinary().pipe(Effect.map((resolved) => resolved !== undefined));
 +
 +    const run = Effect.fn("MakiMcpService.run")(function* (
 +      args: ReadonlyArray<string>,
 +      options?: { readonly stdin?: string | undefined },
 +    ): Effect.fn.Return<unknown, OrchestratorMcpFailure> {
-+      if (!(yield* available)) return yield* unavailable(bin);
-+      const command = ChildProcess.make(bin, [...args], {
++      const resolved = yield* resolveBinary();
++      if (resolved === undefined) return yield* unavailable(configured);
++      const command = ChildProcess.make(resolved, [...args], {
 +        stdin: options?.stdin === undefined ? "ignore" : Stream.make(encoder.encode(options.stdin)),
 +      });
-+      const stdout = yield* spawner
-+        .string(command)
-+        .pipe(
-+          Effect.mapError((error) =>
-+            failed(`t3-maki-tools ${args[0] ?? ""} failed: ${error.message}`),
-+          ),
-+        );
++      const stdout = yield* spawner.string(command).pipe(
++        Effect.mapError((error) =>
++          failed(`t3-maki-tools ${args[0] ?? ""} failed: ${error.message}`),
++        ),
++        Effect.timeoutOrElse({
++          duration: "45 seconds",
++          orElse: () => Effect.fail(failed(`t3-maki-tools ${args[0] ?? ""} timed out after 45s`)),
++        }),
++      );
 +      return yield* decodeJsonOutput(stdout).pipe(
 +        Effect.mapError(() =>
 +          failed(`t3-maki-tools ${args[0] ?? ""} produced no JSON: ${stdout.slice(0, 200)}`),
@@ -109,10 +145,10 @@ index 0000000000..9fcf50cfb5
 +);
 diff --git a/apps/server/src/mcp/McpDeferredTools.test.ts b/apps/server/src/mcp/McpDeferredTools.test.ts
 new file mode 100644
-index 0000000000..30c31718dc
+index 0000000000..cc4d0e9bba
 --- /dev/null
 +++ b/apps/server/src/mcp/McpDeferredTools.test.ts
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,577 @@
 +import { NodeHttpServer } from "@effect/platform-node";
 +import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 +import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -494,6 +530,42 @@ index 0000000000..30c31718dc
 +  ]);
 +});
 +
++it("truncateToolResult reserves the marker budget without splitting surrogate pairs", () => {
++  const hasLoneSurrogate = (value: string) => {
++    for (let index = 0; index < value.length; index++) {
++      const code = value.charCodeAt(index);
++      if (code >= 0xd800 && code <= 0xdbff) {
++        const next = value.charCodeAt(index + 1);
++        if (next < 0xdc00 || next > 0xdfff) return true;
++      }
++      if (code >= 0xdc00 && code <= 0xdfff) {
++        const previous = value.charCodeAt(index - 1);
++        if (previous < 0xd800 || previous > 0xdbff) return true;
++      }
++    }
++    return false;
++  };
++  const text = `${"a".repeat(12)}😀${"b".repeat(80)}😀${"c".repeat(80)}`;
++  const truncated = McpHttpServer.truncateToolResult(
++    new McpSchema.CallToolResult({
++      content: [{ type: "text", text }],
++    }),
++    100,
++  );
++  const output = (truncated.content?.[0] as { text: string }).text;
++  expect(output.length).toBeLessThanOrEqual(100);
++  expect(output).toContain("…[truncated ");
++  expect(hasLoneSurrogate(output)).toBe(false);
++
++  const small = McpHttpServer.truncateToolResult(
++    new McpSchema.CallToolResult({
++      content: [{ type: "text", text: `a😀${"x".repeat(80)}` }],
++    }),
++    2,
++  );
++  expect((small.content?.[0] as { text: string }).text).toBe("a");
++});
++
 +it.effect("code_grep and code_diff forward flags to t3-maki-tools", () =>
 +  Effect.gen(function* () {
 +    const ran: Array<ReadonlyArray<string>> = [];
@@ -655,7 +727,7 @@ index 0000000000..30c31718dc
 +  ),
 +);
 diff --git a/apps/server/src/mcp/McpHttpServer.ts b/apps/server/src/mcp/McpHttpServer.ts
-index 2b1deed86f..eb05f2c375 100644
+index 2b1deed86f..ca1f1db4b1 100644
 --- a/apps/server/src/mcp/McpHttpServer.ts
 +++ b/apps/server/src/mcp/McpHttpServer.ts
 @@ -51,9 +51,15 @@ import {
@@ -750,7 +822,7 @@ index 2b1deed86f..eb05f2c375 100644
  const provideRegistrationServices = <Services>() =>
    McpServer.middleware<{ provides: Services }>()(
      Effect.map(
-@@ -1353,20 +1380,190 @@ const provideRegistrationServices = <Services>() =>
+@@ -1353,20 +1380,203 @@ const provideRegistrationServices = <Services>() =>
      ),
    );
  
@@ -823,17 +895,30 @@ index 2b1deed86f..eb05f2c375 100644
 +};
 +
 +/** Text content past `T3_MCP_RESULT_MAX_CHARS` keeps its head and tail; the tail keeps more. */
-+const truncateToolResult = (result: McpSchema.CallToolResult, maxChars: number) => {
++export const truncateToolResult = (result: McpSchema.CallToolResult, maxChars: number) => {
 +  if (result.content === undefined) return result;
 +  let changed = false;
 +  const content = result.content.map((item) => {
 +    if (item.type !== "text" || item.text.length <= maxChars) return item;
 +    changed = true;
-+    const head = Math.floor(maxChars * 0.4);
-+    const tail = maxChars - head;
++    const text = item.text;
++    if (maxChars <= 64) {
++      let end = maxChars;
++      const endCode = text.charCodeAt(end - 1);
++      if (endCode >= 0xd800 && endCode <= 0xdbff) end -= 1;
++      return { ...item, text: text.slice(0, end) };
++    }
++    const budget = maxChars - 64;
++    let headEnd = Math.floor(budget * 0.4);
++    const headCode = text.charCodeAt(headEnd - 1);
++    if (headCode >= 0xd800 && headCode <= 0xdbff) headEnd -= 1;
++    let tailStart = text.length - (budget - headEnd);
++    const tailCode = text.charCodeAt(tailStart);
++    if (tailCode >= 0xdc00 && tailCode <= 0xdfff) tailStart += 1;
++    const truncated = text.length - headEnd - (text.length - tailStart);
 +    return {
 +      ...item,
-+      text: `${item.text.slice(0, head)}\n…[truncated ${item.text.length - maxChars} chars]…\n${item.text.slice(-tail)}`,
++      text: `${text.slice(0, headEnd)}\n…[truncated ${truncated} chars]…\n${text.slice(tailStart)}`,
 +    };
 +  });
 +  return changed ? new McpSchema.CallToolResult({ ...result, content }) : result;
@@ -869,39 +954,39 @@ index 2b1deed86f..eb05f2c375 100644
 +    });
 +  });
 +
-+// Buffer for sorted tool registration; set only while `layer` builds (single-threaded build).
 +type AddToolOptions = Parameters<McpServer.McpServer["Service"]["addTool"]>[0];
-+let pendingToolRegistrations: Array<AddToolOptions> | undefined;
++const ToolRegistrationBuffer = Context.Reference<Array<AddToolOptions> | undefined>(
++  "t3/mcp/ToolRegistrationBuffer",
++  { defaultValue: () => undefined },
++);
 +
-+/** Deflects `addTool` into `pendingToolRegistrations` so `layer` can replay them name-sorted. */
-+const withRegistrationBuffer = <A, E, R>(
-+  registration: Effect.Effect<A, E, R>,
-+): Effect.Effect<A, E, R | McpServer.McpServer> =>
-+  Effect.suspend((): Effect.Effect<A, E, R | McpServer.McpServer> => {
-+    const buffer = pendingToolRegistrations;
-+    if (buffer === undefined) return registration;
-+    return Effect.gen(function* () {
-+      const server = yield* McpServer.McpServer;
-+      const bufferedServer = McpServer.McpServer.of({
-+        ...server,
-+        get tools() {
-+          return [
-+            ...server.tools,
-+            ...buffer.map((options) => ({
-+              tool: options.tool,
-+              annotations: options.annotations,
-+            })),
-+          ];
-+        },
-+        addTool: Effect.fnUntraced((options: AddToolOptions) =>
-+          Effect.sync(() => {
-+            buffer.push(options);
-+          }),
-+        ),
-+      });
-+      return yield* registration.pipe(Effect.provideService(McpServer.McpServer, bufferedServer));
-+    });
++/** Collects the current layer's registrations before replaying them in name order. */
++const withRegistrationBuffer = Effect.fn("McpHttpServer.withRegistrationBuffer")(function* <
++  A,
++  E,
++  R,
++>(registration: Effect.Effect<A, E, R>) {
++  const buffer = yield* ToolRegistrationBuffer;
++  if (buffer === undefined) return yield* registration;
++  const server = yield* McpServer.McpServer;
++  const bufferedServer = McpServer.McpServer.of({
++    ...server,
++    get tools() {
++      return [
++        ...server.tools,
++        ...buffer.map((options) => ({
++          tool: options.tool,
++          annotations: options.annotations,
++        })),
++      ];
++    },
++    addTool: (options) =>
++      Effect.sync(() => {
++        buffer.push(options);
++      }),
 +  });
++  return yield* registration.pipe(Effect.provideService(McpServer.McpServer, bufferedServer));
++});
 +
  /**
   * Tools declare their handler services as request-level dependencies. Those
@@ -945,7 +1030,7 @@ index 2b1deed86f..eb05f2c375 100644
          ),
        ),
      ),
-@@ -1376,6 +1573,7 @@ export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX,
+@@ -1376,6 +1586,7 @@ export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX,
          Exclude<Tool.Requirements<Tools[keyof Tools]>, McpInvocationContext.McpInvocationContext>
        >().layer,
      ),
@@ -953,7 +1038,7 @@ index 2b1deed86f..eb05f2c375 100644
      Layer.provide(McpServer.McpServer.layer),
      Layer.provide(McpToolAccess.HandlersLayer.layer(handlers)),
    );
-@@ -1384,9 +1582,11 @@ const imageToolRegistration = <Tools extends Record<string, Tool.Any>, A, E, R,
+@@ -1384,9 +1595,11 @@ const imageToolRegistration = <Tools extends Record<string, Tool.Any>, A, E, R,
    register: Effect.Effect<A, E, R>,
    handlers: McpToolAccess.HandlersLayer<Tools, EX, RX>,
  ) =>
@@ -968,7 +1053,7 @@ index 2b1deed86f..eb05f2c375 100644
  
  export const layerHtmlToolkit = Layer.mergeAll(
    toolkitRegistration(HtmlRenderToolkit, HtmlHandlers.layerRender),
-@@ -1531,17 +1731,34 @@ const layerToolExposure = Layer.effect(
+@@ -1531,17 +1744,34 @@ const layerToolExposure = Layer.effect(
    Effect.gen(function* () {
      const server = yield* McpServer.McpServer;
      return McpToolExposure.make(
@@ -1013,7 +1098,7 @@ index 2b1deed86f..eb05f2c375 100644
      );
    }),
  );
-@@ -1550,19 +1767,26 @@ const layerToolExposure = Layer.effect(
+@@ -1550,19 +1780,26 @@ const layerToolExposure = Layer.effect(
   * A provider session that sends `MCP_TOOL_EXPOSURE_HEADER: deferred` lists only
   * the direct tools and what its `tool_search` calls loaded. Calls are never
   * gated, and every other client lists everything but `tool_search`.
@@ -1043,7 +1128,7 @@ index 2b1deed86f..eb05f2c375 100644
      });
    }),
    { global: true },
-@@ -1635,6 +1859,114 @@ export const layerMilestoneEvents = Layer.effectDiscard(
+@@ -1635,6 +1872,113 @@ export const layerMilestoneEvents = Layer.effectDiscard(
    Layer.provide(layerWebhookTransport),
  );
  
@@ -1148,13 +1233,12 @@ index 2b1deed86f..eb05f2c375 100644
 +  Effect.gen(function* () {
 +    if (!mcpDeferTools() && !mcpStaticToolList()) return layerRegistrations;
 +    const buffer: Array<AddToolOptions> = [];
-+    pendingToolRegistrations = buffer;
-+    const built = yield* Layer.build(layerRegistrations).pipe(Effect.exit);
-+    pendingToolRegistrations = undefined;
-+    if (built._tag === "Failure") return yield* Effect.failCause(built.cause);
++    yield* Layer.build(layerRegistrations).pipe(
++      Effect.provideService(ToolRegistrationBuffer, buffer),
++    );
 +    const server = yield* McpServer.McpServer;
-+    const sorted = [...buffer].sort((a, b) => (a.tool.name < b.tool.name ? -1 : 1));
-+    for (const options of sorted) yield* server.addTool(options);
++    buffer.sort((a, b) => (a.tool.name < b.tool.name ? -1 : a.tool.name > b.tool.name ? 1 : 0));
++    for (const options of buffer) yield* server.addTool(options);
 +    return Layer.empty;
 +  }),
 +);
@@ -1619,10 +1703,10 @@ index 0000000000..6abb3e35c7
 +});
 diff --git a/apps/server/src/mcp/toolkits/maki/tools.ts b/apps/server/src/mcp/toolkits/maki/tools.ts
 new file mode 100644
-index 0000000000..f1dfaaadb2
+index 0000000000..32640c0672
 --- /dev/null
 +++ b/apps/server/src/mcp/toolkits/maki/tools.ts
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,148 @@
 +import { OrchestratorMcpFailure } from "@t3tools/contracts";
 +import * as Schema from "effect/Schema";
 +import { McpSchema, Tool, Toolkit } from "effect/ai";
@@ -1634,14 +1718,15 @@ index 0000000000..f1dfaaadb2
 +
 +const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 +const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
++const NonNegativeNumber = Schema.Number.check(Schema.isGreaterThanOrEqualTo(0));
 +
 +const CodeIndexTool = Tool.make("code_index", {
 +  description:
 +    "Index a file or directory with the Maki code tools: returns an AST skeleton with [start-end] line ranges, plus line, file, and symbol counts. Call this before reading a large file.",
 +  parameters: Schema.Struct({
 +    path: Schema.String,
-+    maxDepth: Schema.optional(PositiveInt),
-+    maxLines: Schema.optional(PositiveInt),
++    maxDepth: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(16))),
++    maxLines: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(10_000))),
 +  }),
 +  success: Schema.Unknown,
 +  failure: OrchestratorMcpFailure,
@@ -1660,7 +1745,7 @@ index 0000000000..f1dfaaadb2
 +    symbol: Schema.optional(Schema.String),
 +    start: Schema.optional(PositiveInt),
 +    end: Schema.optional(PositiveInt),
-+    maxBytes: Schema.optional(PositiveInt),
++    maxBytes: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(1_048_576))),
 +  }),
 +  success: Schema.Unknown,
 +  failure: OrchestratorMcpFailure,
@@ -1673,12 +1758,12 @@ index 0000000000..f1dfaaadb2
 +
 +const CodeExecTool = Tool.make("code_exec", {
 +  description:
-+    "Run a local script (stdin) through the Maki code tools and get { exitCode, stdout, stderr, truncated, durationMs }. Use it for multi-file filtering or summarizing instead of dumping full files.",
++    "Run a local script (stdin) through the Maki code tools and get { exitCode, stdout, stderr, truncated, timedOut, durationMs }. Use it for multi-file filtering or summarizing instead of dumping full files.",
 +  parameters: Schema.Struct({
 +    script: Schema.String,
 +    cwd: Schema.optional(Schema.String),
-+    timeoutMs: Schema.optional(PositiveInt),
-+    maxBytes: Schema.optional(PositiveInt),
++    timeoutMs: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(30_000))),
++    maxBytes: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(1_048_576))),
 +  }),
 +  success: Schema.Unknown,
 +  failure: OrchestratorMcpFailure,
@@ -1696,8 +1781,8 @@ index 0000000000..f1dfaaadb2
 +    pattern: Schema.String,
 +    path: Schema.String,
 +    glob: Schema.optional(Schema.String),
-+    maxHits: Schema.optional(PositiveInt),
-+    maxBytes: Schema.optional(PositiveInt),
++    maxHits: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(5_000))),
++    maxBytes: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(1_048_576))),
 +  }),
 +  success: Schema.Unknown,
 +  failure: OrchestratorMcpFailure,
@@ -1715,7 +1800,7 @@ index 0000000000..f1dfaaadb2
 +    cwd: Schema.String,
 +    rev: Schema.optional(Schema.String),
 +    path: Schema.optional(Schema.String),
-+    maxBytes: Schema.optional(PositiveInt),
++    maxBytes: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(1_048_576))),
 +  }),
 +  success: Schema.Unknown,
 +  failure: OrchestratorMcpFailure,
@@ -1734,10 +1819,10 @@ index 0000000000..f1dfaaadb2
 +  instruction: NonNegativeInt,
 +  summarizer_reuses_prefix: Schema.Boolean,
 +  prices: Schema.Struct({
-+    input: Schema.Number,
-+    output: Schema.Number,
-+    cache_read: Schema.Number,
-+    cache_write: Schema.Number,
++    input: NonNegativeNumber,
++    output: NonNegativeNumber,
++    cache_read: NonNegativeNumber,
++    cache_write: NonNegativeNumber,
 +  }),
 +  remaining_turns: Schema.optional(NonNegativeInt),
 +});
@@ -2851,7 +2936,7 @@ index b413f02d83..49c891105f 100644
    const actual = await importOriginal<typeof NodeWorkerThreads>();
    class RecordedWorker extends actual.Worker {
 diff --git a/apps/server/src/persistence/Sqlite.ts b/apps/server/src/persistence/Sqlite.ts
-index d9506e3115..7915ff995d 100644
+index d9506e3115..1c43e6eccb 100644
 --- a/apps/server/src/persistence/Sqlite.ts
 +++ b/apps/server/src/persistence/Sqlite.ts
 @@ -1,3 +1,4 @@
@@ -2863,11 +2948,11 @@ index d9506e3115..7915ff995d 100644
        yield* sql`PRAGMA synchronous = NORMAL;`;
        // macOS fsync misses drive caches; F_FULLFSYNC flushes them at checkpoints and is ignored elsewhere.
        yield* sql`PRAGMA checkpoint_fullfsync = ON;`;
-+      // T3_SQLITE_CACHE_KB sets the page cache size in KiB (negative cache_size); unset keeps SQLite's default.
-+      const cacheKb = Number.parseInt(
-+        (yield* Config.String("T3_SQLITE_CACHE_KB").pipe(Config.withDefault(""))).trim(),
-+        10,
-+      );
++      // T3_SQLITE_WRITER_CACHE_KB overrides T3_SQLITE_CACHE_KB here; both are negative cache_size in KiB.
++      const rawCacheKb =
++        (yield* Config.String("T3_SQLITE_WRITER_CACHE_KB").pipe(Config.withDefault(""))).trim() ||
++        (yield* Config.String("T3_SQLITE_CACHE_KB").pipe(Config.withDefault(""))).trim();
++      const cacheKb = Number.parseInt(rawCacheKb, 10);
 +      if (cacheKb > 0) yield* sql.unsafe(`PRAGMA cache_size = ${-cacheKb};`);
        // Keep statement journals and sort spills off the disk.
        // Large statements and open savepoints can increase peak memory use.
@@ -3342,13 +3427,27 @@ index 267e402900..43aba8cfef 100644
      rawCode === null ? null : boundedText(rawCode, MAX_PROVIDER_FAILURE_CODE_LENGTH) || null;
  
 diff --git a/packages/provider-core/src/server/orchestrationInstructions.test.ts b/packages/provider-core/src/server/orchestrationInstructions.test.ts
-index ca3c3432d5..25b2776165 100644
+index ca3c3432d5..2b76ebba75 100644
 --- a/packages/provider-core/src/server/orchestrationInstructions.test.ts
 +++ b/packages/provider-core/src/server/orchestrationInstructions.test.ts
-@@ -98,3 +98,78 @@ describe("T3 device instructions", () => {
+@@ -97,4 +97,92 @@ describe("T3 device instructions", () => {
+     );
      assert.notInclude(t3AcpPromptWithInstructions({ prompt: "Hi.", state }), "## T3 Code devices");
    });
- });
++
++  it("reads T3_DEFER_MCP_TOOLS when instructions are generated", () => {
++    const prior = process.env.T3_DEFER_MCP_TOOLS;
++    try {
++      process.env.T3_DEFER_MCP_TOOLS = "1";
++      assert.include(t3OrchestrationSystemPrompt(true, true)!, "### Deferred T3 tools");
++      process.env.T3_DEFER_MCP_TOOLS = "0";
++      assert.notInclude(t3OrchestrationSystemPrompt(true, true)!, "### Deferred T3 tools");
++    } finally {
++      if (prior === undefined) delete process.env.T3_DEFER_MCP_TOOLS;
++      else process.env.T3_DEFER_MCP_TOOLS = prior;
++    }
++  });
++});
 +
 +describe("T3 compact instructions", () => {
 +  const state = { interactionMode: "default", hasT3Mcp: true, hasDeviceTools: false } as const;
@@ -3423,16 +3522,16 @@ index ca3c3432d5..25b2776165 100644
 +    // Unset restores the verbose sections.
 +    assert.include(t3OrchestrationSystemPrompt(true, false)!, "## T3 Code orchestration");
 +  });
-+});
+ });
 diff --git a/packages/provider-core/src/server/orchestrationInstructions.ts b/packages/provider-core/src/server/orchestrationInstructions.ts
-index 3f97035bda..10677bef3f 100644
+index 3f97035bda..81575667e0 100644
 --- a/packages/provider-core/src/server/orchestrationInstructions.ts
 +++ b/packages/provider-core/src/server/orchestrationInstructions.ts
 @@ -29,6 +29,41 @@ export const T3_CODE_ORCHESTRATION_INSTRUCTIONS = `
  ${T3_CODE_ORCHESTRATION_SECTIONS.join("\n\n")}
  `;
  
-+const deferMcpTools = process.env.T3_DEFER_MCP_TOOLS === "1";
++const deferMcpTools = () => process.env.T3_DEFER_MCP_TOOLS === "1";
 +
 +/**
 + * With `T3_DEFER_MCP_TOOLS=1` the listed set is fixed at 9 tools, so this
@@ -3497,14 +3596,14 @@ index 3f97035bda..10677bef3f 100644
 +          : T3_CODE_ACP_DEFAULT_MODE_INSTRUCTIONS,
 +        ...(input.state.hasT3Mcp
 +          ? [
-+              ...(deferMcpTools
++              ...(deferMcpTools()
 +                ? []
 +                : [
 +                    T3_CODE_BROWSER_TOOL_INSTRUCTIONS.trim(),
 +                    ...(input.state.hasDeviceTools ? [T3_CODE_DEVICE_TOOL_INSTRUCTIONS] : []),
 +                  ]),
 +              T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim(),
-+              ...(deferMcpTools ? [T3_CODE_DEFERRED_MCP_INSTRUCTIONS] : []),
++              ...(deferMcpTools() ? [T3_CODE_DEFERRED_MCP_INSTRUCTIONS] : []),
 +              T3_CODE_ACP_MCP_FALLBACK_INSTRUCTIONS,
 +            ]
 +          : []),
@@ -3518,7 +3617,7 @@ index 3f97035bda..10677bef3f 100644
 -    : T3_CODE_ORCHESTRATION_INSTRUCTIONS;
 +  compactInstructions()
 +    ? `${compactOrchestrationInstructions()}\n`
-+    : deferMcpTools
++    : deferMcpTools()
 +      ? `${T3_CODE_ORCHESTRATION_INSTRUCTIONS}\n${T3_CODE_DEFERRED_MCP_INSTRUCTIONS}\n`
 +      : hasDeviceTools
 +        ? `${T3_CODE_ORCHESTRATION_INSTRUCTIONS}\n${T3_CODE_DEVICE_TOOL_INSTRUCTIONS}\n`
@@ -4302,7 +4401,7 @@ index 71a9897b84..08af721b1a 100644
        yield* Effect.all([caughtUp, sql`DELETE FROM blobs WHERE rowid = 1`], { concurrency: 2 });
        yield* sql`DELETE FROM blobs WHERE rowid = 2`;
 diff --git a/packages/shared/src/nodeSqliteClient.ts b/packages/shared/src/nodeSqliteClient.ts
-index bb00de7459..e7a475d1f5 100644
+index bb00de7459..f9bc1320c7 100644
 --- a/packages/shared/src/nodeSqliteClient.ts
 +++ b/packages/shared/src/nodeSqliteClient.ts
 @@ -1,4 +1,5 @@
@@ -4311,7 +4410,7 @@ index bb00de7459..e7a475d1f5 100644
  import * as NodeUtil from "node:util";
  import * as NodeWorkerThreads from "node:worker_threads";
  
-@@ -196,6 +197,78 @@ const hasLargeBinding = (params: ReadonlyArray<unknown>): boolean => {
+@@ -196,6 +197,79 @@ const hasLargeBinding = (params: ReadonlyArray<unknown>): boolean => {
  // A reader refuses a database outside WAL mode with this code; retrying cannot change that.
  const NOT_WAL = "ERR_SQLITE_NOT_WAL";
  
@@ -4345,6 +4444,7 @@ index bb00de7459..e7a475d1f5 100644
 +      readonly requireWal: boolean;
 +      readonly prepareCacheSize?: number | undefined;
 +      readonly cacheSizeKb?: number | undefined;
++      readonly tempStore?: "DEFAULT" | "FILE" | "MEMORY" | undefined;
 +    }) => Promise<NativeWorkerConnection>;
 +  };
 +  readonly NativeCheckpointWorker: {
@@ -4390,7 +4490,15 @@ index bb00de7459..e7a475d1f5 100644
  // Inline worker source also runs in bundles and single-executable builds without module files.
  const workerSource = `
  const { parentPort, workerData } = require("node:worker_threads");
-@@ -329,6 +402,27 @@ type WorkerReply =
+@@ -221,6 +295,7 @@ try {
+     throw Object.assign(new Error("database uses journal_mode " + mode + ", not wal"), { code: ${JSON.stringify(NOT_WAL)} });
+   }
+   db = next;
++  if (workerData.tempStore) db.exec("PRAGMA temp_store = " + workerData.tempStore + ";");
+   parentPort.postMessage({ type: "ready" });
+ } catch (error) {
+   parentPort.postMessage({ type: "unavailable", ...describe(error) });
+@@ -329,6 +404,27 @@ type WorkerReply =
        readonly error: WorkerFailure & { readonly operation: "open" | "prepare" | "execute" };
      };
  
@@ -4418,7 +4526,7 @@ index bb00de7459..e7a475d1f5 100644
  const workerFailureMessages = {
    open: "Failed to open database",
    prepare: "Failed to prepare statement",
-@@ -353,6 +447,8 @@ const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test
+@@ -353,6 +449,8 @@ const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test
  
  // WAL readers run concurrently; one worker serialized every read behind the slowest transaction.
  const READER_POOL_SIZE = 4;
@@ -4427,12 +4535,13 @@ index bb00de7459..e7a475d1f5 100644
  const READER_STARTUP_TIMEOUT = Duration.seconds(10);
  const READER_RETRY_DELAY = Duration.seconds(1);
  const READER_RETRY_MAX_DELAY = Duration.minutes(1);
-@@ -363,12 +459,14 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -363,12 +461,15 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
    readonly role: "reader" | "writer";
    readonly readOnly: boolean;
    readonly onReply?: () => void;
 +  readonly native?: NativeSqliteApi | undefined;
 +  readonly cacheSizeKb?: number | undefined;
++  readonly tempStore?: "DEFAULT" | "FILE" | "MEMORY" | undefined;
  }) {
    const label = options.role === "reader" ? "Database reader" : "Database writer";
    const readOnly = options.readOnly;
@@ -4443,7 +4552,7 @@ index bb00de7459..e7a475d1f5 100644
          readonly connection: Connection;
          readonly started: Promise<WorkerStartup>;
        }
-@@ -380,16 +478,6 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -380,16 +481,6 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
    let writerStopped: string | undefined;
  
    const start = () => {
@@ -4460,7 +4569,7 @@ index bb00de7459..e7a475d1f5 100644
      let announce: (startup: WorkerStartup) => void = () => {};
      const started = new Promise<WorkerStartup>((resolve) => {
        announce = resolve;
-@@ -399,7 +487,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -399,7 +490,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
        number,
        {
          readonly endsTransaction: boolean;
@@ -4469,7 +4578,7 @@ index bb00de7459..e7a475d1f5 100644
          readonly rows: Array<unknown>;
          readonly resume: (reply: WorkerReply) => void;
        }
-@@ -408,7 +496,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -408,7 +499,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
        stoppedMessage = message;
        if (options.role === "writer") writerStopped = message;
        announce({ type: "unavailable", message });
@@ -4478,7 +4587,7 @@ index bb00de7459..e7a475d1f5 100644
        for (const [id, request] of pending) {
          request.resume(
            request.endsTransaction
-@@ -418,22 +506,19 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -418,22 +509,19 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
        }
        pending.clear();
      };
@@ -4507,7 +4616,7 @@ index bb00de7459..e7a475d1f5 100644
        options.onReply?.();
        if ("rows" in reply && request.rows.length > 0) {
          for (const row of reply.rows) request.rows.push(row);
-@@ -441,9 +526,139 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -441,9 +529,141 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
        } else {
          request.resume(reply);
        }
@@ -4546,6 +4655,7 @@ index bb00de7459..e7a475d1f5 100644
 +                requireWal: options.role === "reader",
 +                allowExtension: false,
 +                prepareCacheSize: 200,
++                ...(options.tempStore === undefined ? {} : { tempStore: options.tempStore }),
 +              },
 +            });
 +            worker.on("message", (reply: WorkerReply | WorkerStartup) => {
@@ -4587,6 +4697,7 @@ index bb00de7459..e7a475d1f5 100644
 +              requireWal: options.role === "reader",
 +              prepareCacheSize: 200,
 +              ...(options.cacheSizeKb === undefined ? {} : { cacheSizeKb: options.cacheSizeKb }),
++              ...(options.tempStore === undefined ? {} : { tempStore: options.tempStore }),
 +            });
 +            const shutdown = () =>
 +              opened.then(
@@ -4650,7 +4761,7 @@ index bb00de7459..e7a475d1f5 100644
  
      const request = (input: WorkerRequest) =>
        Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
-@@ -459,7 +674,11 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -459,7 +679,11 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
          const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
          const reply = Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
            const id = nextRequestId++;
@@ -4663,7 +4774,7 @@ index bb00de7459..e7a475d1f5 100644
            pending.set(id, {
              endsTransaction,
              received,
-@@ -471,18 +690,16 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -471,18 +695,16 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
                    : Effect.fail(failedWith(reply.error, reply.error.operation)),
                ),
            });
@@ -4685,7 +4796,7 @@ index bb00de7459..e7a475d1f5 100644
            // An unsent savepoint must stay queued, or its rollback would target an older sibling's.
            pendingSavepoints.length = 0;
          });
-@@ -536,7 +753,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -536,7 +758,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
          return Stream.die(new UnsupportedNodeSqliteOperationError());
        },
      });
@@ -4694,7 +4805,7 @@ index bb00de7459..e7a475d1f5 100644
      return current;
    };
  
-@@ -545,20 +762,16 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -545,20 +767,16 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
        const open = current;
        if (open === undefined) return;
        if (options.role === "writer") {
@@ -4721,7 +4832,7 @@ index bb00de7459..e7a475d1f5 100644
    };
  
    return Effect.suspend((): Effect.Effect<Connection, SqlError> => {
-@@ -590,7 +803,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
+@@ -590,7 +808,7 @@ const makeWorkerConnection = Effect.fnUntraced(function* (options: {
              ? Effect.succeed(entry.connection)
              : Effect.fail(failedWith({ message: `${label} stopped while starting` }, "open"));
          }
@@ -4730,7 +4841,7 @@ index bb00de7459..e7a475d1f5 100644
          return Effect.fail(
            failedWith(
              outcome ?? {
-@@ -614,8 +827,19 @@ const startFailure = (error: SqlError) => {
+@@ -614,8 +832,21 @@ const startFailure = (error: SqlError) => {
  
  // A reader that cannot start turns off the whole pool, so routing never picks a dead slot, until
  // one background retry starts it again.
@@ -4741,6 +4852,7 @@ index bb00de7459..e7a475d1f5 100644
 +  pool: { unavailable: boolean },
 +  native: NativeSqliteApi | undefined,
 +  cacheSizeKb: number | undefined,
++  tempStore: "DEFAULT" | "FILE" | "MEMORY" | undefined,
 +) {
 +  const acquire = yield* makeWorkerConnection({
 +    filename,
@@ -4748,11 +4860,12 @@ index bb00de7459..e7a475d1f5 100644
 +    readOnly: true,
 +    native,
 +    cacheSizeKb,
++    tempStore,
 +  });
    const scope = yield* Effect.scope;
    const context = yield* Effect.context<never>();
  
-@@ -724,18 +948,72 @@ const sqliteVersion = () => {
+@@ -724,18 +955,72 @@ const sqliteVersion = () => {
  };
  
  // Returns the writer's per-statement notification, or undefined when the writer checkpoints alone.
@@ -4827,7 +4940,7 @@ index bb00de7459..e7a475d1f5 100644
    const started = Result.try(
      () =>
        new NodeWorkerThreads.Worker(checkpointWorkerSource, {
-@@ -749,7 +1027,6 @@ const startCheckpointWorker = Effect.fnUntraced(function* (filename: string) {
+@@ -749,7 +1034,6 @@ const startCheckpointWorker = Effect.fnUntraced(function* (filename: string) {
    }
    const worker = started.success;
    worker.unref();
@@ -4835,7 +4948,7 @@ index bb00de7459..e7a475d1f5 100644
    let stopped = false;
    const stop = (reason: string) => {
      if (stopped) return;
-@@ -928,6 +1205,30 @@ const make = Effect.fn("makeWithDatabase")(function* (
+@@ -928,6 +1212,35 @@ const make = Effect.fn("makeWithDatabase")(function* (
  
    const semaphore = yield* Semaphore.make(1);
    const writerWorker = options.writerWorker === true && isFileDatabase;
@@ -4863,15 +4976,21 @@ index bb00de7459..e7a475d1f5 100644
 +  const cacheSizeKb = envInt("T3_SQLITE_CACHE_KB");
 +  const readerCacheSizeKb = envInt("T3_SQLITE_READER_CACHE_KB") ?? cacheSizeKb;
 +  const writerCacheSizeKb = envInt("T3_SQLITE_WRITER_CACHE_KB") ?? cacheSizeKb;
++  const rawTempStore = process.env.T3_SQLITE_TEMP_STORE?.trim().toUpperCase();
++  const tempStore =
++    rawTempStore === "FILE" || rawTempStore === "DEFAULT" || rawTempStore === "MEMORY"
++      ? rawTempStore
++      : undefined;
    let checkpointAfterWrite: (() => void) | undefined;
    const writerConnection: Effect.Effect<Connection, SqlError> = writerWorker
      ? yield* makeWorkerConnection({
-@@ -935,13 +1236,15 @@ const make = Effect.fn("makeWithDatabase")(function* (
+@@ -935,13 +1248,16 @@ const make = Effect.fn("makeWithDatabase")(function* (
          role: "writer",
          readOnly: options.readonly ?? false,
          onReply: () => checkpointAfterWrite?.(),
 +        native: native.module,
 +        cacheSizeKb: writerCacheSizeKb,
++        tempStore,
        })
      : Effect.succeed(yield* makeConnection);
    // Opening now fails the layer for a file that is not a database, not its first query.
@@ -4883,7 +5002,7 @@ index bb00de7459..e7a475d1f5 100644
      if (checkpointAfterWrite !== undefined) {
        yield* opened.executeUnprepared(
          `PRAGMA wal_autocheckpoint = ${WRITER_BACKSTOP_FRAMES}`,
-@@ -953,9 +1256,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
+@@ -953,9 +1269,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
    const readerPool = { unavailable: false };
    const readers =
      options.readerWorker && isFileDatabase
@@ -4892,7 +5011,7 @@ index bb00de7459..e7a475d1f5 100644
            Effect.map(
 -            Effect.all([makeReader(options.filename, readerPool), Semaphore.make(1)]),
 +            Effect.all([
-+              makeReader(options.filename, readerPool, native.module, readerCacheSizeKb),
++              makeReader(options.filename, readerPool, native.module, readerCacheSizeKb, tempStore),
 +              Semaphore.make(1),
 +            ]),
              ([acquire, lock]) => ({

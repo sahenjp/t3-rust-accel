@@ -1,5 +1,6 @@
 //! `slice --path` — extract a symbol body or an exact line range as `L<n>:` lines.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use serde_json::json;
@@ -9,15 +10,20 @@ use crate::text::head_tail_bytes;
 use crate::{emit, fail};
 
 fn format_lines(src: &str, start_line: usize, end_line: usize) -> String {
-    src.lines()
-        .enumerate()
-        .filter(|(i, _)| *i + 1 >= start_line && *i < end_line)
-        .map(|(i, l)| format!("L{}: {l}", i + 1))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    for (i, line) in src.lines().enumerate() {
+        if i + 1 < start_line || i >= end_line {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        write!(&mut out, "L{}: {line}", i + 1).expect("writing to a String cannot fail");
+    }
+    out
 }
 
-pub fn cmd_slice(
+pub(crate) fn cmd_slice(
     path: &str,
     symbol: Option<&str>,
     start: Option<usize>,

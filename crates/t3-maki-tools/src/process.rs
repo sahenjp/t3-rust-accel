@@ -1,5 +1,7 @@
 //! Shared process-launch helpers.
 
+use std::collections::VecDeque;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// True when `path` is a regular file that can be executed.
@@ -40,7 +42,7 @@ fn candidates_in(dir: &Path, program: &str) -> Vec<PathBuf> {
 /// Relative and empty PATH entries are intentionally ignored. In particular,
 /// this prevents Windows process creation from picking up a `git.exe` or
 /// `python.exe` planted in the current directory.
-pub fn resolve_executable(program: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_executable(program: &str) -> Option<PathBuf> {
     if program.is_empty() {
         return None;
     }
@@ -65,6 +67,41 @@ pub fn resolve_executable(program: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Read a pipe to EOF while retaining enough bytes for later head+tail
+/// truncation. The stream is always drained so the child never blocks on a
+/// full pipe. When more than `cap` bytes are emitted, the first half and the
+/// final half are retained rather than losing the ending diagnostics.
+pub(crate) fn drain_capped<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, u64) {
+    let head_cap = cap / 2;
+    let tail_cap = cap - head_cap;
+    let mut head = Vec::with_capacity(head_cap.min(8192));
+    let mut tail: VecDeque<u8> = VecDeque::with_capacity(tail_cap.min(8192));
+    let mut total = 0u64;
+    let mut buf = [0u8; 8192];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                total = total.saturating_add(n as u64);
+                let mut start = 0usize;
+                if head.len() < head_cap {
+                    let room = head_cap - head.len();
+                    let take = n.min(room);
+                    head.extend_from_slice(&buf[..take]);
+                    start = take;
+                }
+                if start < n {
+                    tail.extend(&buf[start..n]);
+                    while tail.len() > tail_cap {
+                        tail.pop_front();
+                    }
+                }
+            }
+        }
+    }
+    (head.into_iter().chain(tail).collect(), total)
 }
 
 #[cfg(test)]

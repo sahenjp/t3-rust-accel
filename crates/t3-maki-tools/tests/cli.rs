@@ -332,6 +332,37 @@ fn slice_go_receiver_qualified_method() {
         .contains("func (s *S) Get() int"));
 }
 
+#[test]
+fn index_and_slice_cpp_template_struct_inside_header_guard() {
+    let dir = tmpdir("cpp_guard");
+    let f = dir.join("policy.hpp");
+    write(
+        &f,
+        "#ifndef POLICY_GUARD\n#define POLICY_GUARD\n\ntemplate <typename T>\nstruct Policy {\n    void apply();\n};\n\n#endif\n",
+    );
+    let (v, code) = run(&["index", "--path", f.to_str().unwrap()], b"");
+    assert_eq!(code, 0);
+    let v = ok(&v);
+    let sk = v["skeleton"].as_str().unwrap();
+    assert!(sk.contains("struct Policy"), "{sk}");
+    assert!(sk.contains("apply"), "{sk}");
+
+    let (v, code) = run(
+        &[
+            "slice",
+            "--path",
+            f.to_str().unwrap(),
+            "--symbol",
+            "Policy::apply",
+        ],
+        b"",
+    );
+    assert_eq!(code, 0, "{v}");
+    let v = ok(&v);
+    assert_eq!(v["symbol"], "Policy::apply");
+    assert!(v["content"].as_str().unwrap().contains("void apply();"));
+}
+
 // ---------------- grep ----------------
 
 #[test]
@@ -489,6 +520,26 @@ fn grep_invalid_regex_error_json() {
         .as_str()
         .unwrap()
         .contains("invalid --pattern regex"));
+}
+
+#[test]
+fn grep_accepts_dash_prefixed_pattern_value() {
+    let dir = tmpdir("grep_dash_pattern");
+    write(&dir.join("a.rs"), "fn f() {} // --foo\n");
+    let (v, code) = run(
+        &[
+            "grep",
+            "--pattern",
+            "--foo",
+            "--path",
+            dir.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert_eq!(code, 0, "{v}");
+    let v = ok(&v);
+    assert_eq!(v["totalHits"], 1);
+    assert!(v["output"].as_str().unwrap().contains("--foo"));
 }
 
 #[test]
@@ -684,6 +735,110 @@ fn diff_rejects_option_like_rev_without_invoking_git() {
 }
 
 #[test]
+fn diff_rejects_option_like_rev_in_separate_argv_slot() {
+    let dir = git_repo("diff_rev_separate_injection");
+    write(&dir.join("a.rs"), "fn main() {}\n");
+    git_commit(&dir, "init");
+    let planted = dir.join("evil-separate.patch");
+    let rev = format!("--output={}", planted.display());
+    let (v, code) = run(
+        &["diff", "--cwd", dir.to_str().unwrap(), "--rev", &rev],
+        b"",
+    );
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["error"].as_str().unwrap().contains("invalid --rev"),
+        "{v}"
+    );
+    assert!(!planted.exists(), "git --output must not be reached");
+}
+
+#[test]
+fn cli_rejects_unknown_flags_positionals_and_invalid_numbers() {
+    let dir = tmpdir("cli_strict_args");
+    let f = dir.join("a.rs");
+    write(&f, "fn main() {}\n");
+
+    let (v, code) = run(&["index", "--paths", f.to_str().unwrap()], b"");
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().unwrap().contains("unknown flag"), "{v}");
+
+    let (v, code) = run(&["index", "--path", f.to_str().unwrap(), "extra"], b"");
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected positional"),
+        "{v}"
+    );
+
+    let (v, code) = run(
+        &[
+            "index",
+            "--path",
+            f.to_str().unwrap(),
+            "--max-lines",
+            "nope",
+        ],
+        b"",
+    );
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["error"].as_str().unwrap().contains("invalid integer"),
+        "{v}"
+    );
+}
+
+#[test]
+fn diff_rejects_pathspec_escape_and_parent_traversal() {
+    let dir = git_repo("diff_path_escape");
+    write(&dir.join("outside.rs"), "fn outside() { secret(); }\n");
+    write(&dir.join("sub/inside.rs"), "fn inside() {}\n");
+    git_commit(&dir, "init");
+    write(&dir.join("outside.rs"), "fn outside() { leaked(); }\n");
+    write(&dir.join("sub/inside.rs"), "fn inside() { changed(); }\n");
+    let sub = dir.join("sub");
+
+    for bad in [":(top)", "../outside.rs"] {
+        let (v, code) = run(
+            &["diff", "--cwd", sub.to_str().unwrap(), "--path", bad],
+            b"",
+        );
+        assert_eq!(code, 1, "{bad}: {v}");
+        assert_eq!(v["ok"], false);
+        assert!(v.get("diff").is_none(), "{bad} leaked a diff: {v}");
+    }
+}
+
+#[test]
+fn diff_rename_header_keeps_old_and_new_paths() {
+    let dir = git_repo("diff_rename");
+    write(&dir.join("old.txt"), "same contents\n");
+    git_commit(&dir, "init");
+    git(&["mv", "old.txt", "new.txt"], &dir);
+    git_commit(&dir, "rename");
+    let (v, code) = run(
+        &[
+            "diff",
+            "--cwd",
+            dir.to_str().unwrap(),
+            "--rev",
+            "HEAD~1..HEAD",
+        ],
+        b"",
+    );
+    assert_eq!(code, 0, "{v}");
+    let v = ok(&v);
+    let d = v["diff"].as_str().unwrap();
+    assert!(d.contains("R100 old.txt -> new.txt"), "{d}");
+}
+
+#[test]
 fn diff_max_bytes_truncation() {
     let dir = git_repo("diff_trunc");
     let mut src = String::new();
@@ -767,6 +922,28 @@ print('done')
     assert_eq!(result["exitCode"], 0);
     assert_eq!(result["timedOut"], false);
     assert!(started.elapsed().as_secs() < 5);
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_setsid_grandchild_pipe_does_not_hang() {
+    let dir = tmpdir("exec_setsid_pipe");
+    let started = std::time::Instant::now();
+    let (v, _) = run(
+        &["exec", "--cwd", dir.to_str().unwrap()],
+        b"import os, subprocess, sys
+subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], preexec_fn=os.setsid)
+print('done')
+",
+    );
+    assert!(
+        started.elapsed().as_secs() < 5,
+        "took {:?}",
+        started.elapsed()
+    );
+    let v = ok(&v);
+    assert_eq!(v["exitCode"], 0, "{v}");
+    assert_eq!(v["timedOut"], false);
 }
 
 #[test]
@@ -893,39 +1070,30 @@ fn econ_matches_reference_break_even() {
     assert_eq!(v["shouldCompact"], false);
 }
 
-// ---------------- prune ----------------
-
 #[test]
-fn prune_utf8_safe_head_tail() {
-    let mut big = String::new();
-    for i in 0..2000 {
-        big.push_str(&format!("行{i:04} "));
-    }
-    let (v, _) = run(&["prune", "--max-chars", "200"], big.as_bytes());
-    let v = ok(&v);
-    assert_eq!(v["pruned"], true);
-    let text = v["text"].as_str().unwrap();
-    assert!(text.chars().count() <= 200);
-    assert!(text.contains("chars pruned"));
-    let marker = text.find("chars pruned").unwrap();
-    assert!(text[..marker].contains("行0000"));
-    assert!(text[marker..].contains("行1999"));
+fn econ_rejects_negative_and_nonfinite_numeric_inputs() {
+    let negative = br#"{"prefix":0,"replaced":1000,"summary":100,"tail":0,"instruction":0,"summarizer_reuses_prefix":true,"prices":{"input":-1.0,"output":5.0,"cache_read":0.1,"cache_write":1.25}}"#;
+    let (v, code) = run(&["econ"], negative);
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert!(v["error"].as_str().unwrap().contains("prices.input"), "{v}");
+
+    let negative_turns = br#"{"prefix":0,"replaced":1000,"summary":100,"tail":0,"instruction":0,"summarizer_reuses_prefix":true,"prices":{"input":1.0,"output":5.0,"cache_read":0.1,"cache_write":1.25},"remaining_turns":-1}"#;
+    let (v, code) = run(&["econ"], negative_turns);
+    assert_eq!(code, 1);
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["error"].as_str().unwrap().contains("remaining_turns"),
+        "{v}"
+    );
 }
 
-#[test]
-fn prune_passthrough_small() {
-    let (v, _) = run(&["prune"], b"hello");
-    let v = ok(&v);
-    assert_eq!(v["pruned"], false);
-    assert_eq!(v["text"], "hello");
-    assert_eq!(v["originalChars"], 5);
-    assert_eq!(v["finalChars"], 5);
-}
+// ---------------- stdin defensive cap ----------------
 
 #[test]
 fn stdin_over_defensive_cap_is_json_error() {
     let input = vec![b'x'; 16 * 1024 * 1024 + 1];
-    let (v, code) = run(&["prune", "--max-chars", "100"], &input);
+    let (v, code) = run(&["econ"], &input);
     assert_eq!(code, 1);
     assert_eq!(v["ok"], false);
     assert!(v["error"].as_str().unwrap().contains("input limit"), "{v}");

@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/t3-maki-tools",
+    "crates/t3-native-sqlite",
+    "crates/t3-rust-bridge",
+]
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[profile.release.package.t3-native-sqlite]
+opt-level = 3
+strip = "symbols"

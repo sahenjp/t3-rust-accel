@@ -9,14 +9,9 @@ license = "MIT"
 name = "t3-rust-bridge"
 path = "src/main.rs"
 
-[lib]
-name = "t3_rust_bridge"
-path = "src/lib.rs"
-
 [dependencies]
 tokio = { version = "1", default-features = false, features = [
     "rt",
-    "macros",
     "io-std",
     "io-util",
     "sync",
@@ -35,8 +30,5 @@ http-body-util = "0.1"
 bytes = "1"
 http = "1"
 
-[profile.release]
-opt-level = "s"
-lto = "thin"
-strip = true
-codegen-units = 1
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros"] }

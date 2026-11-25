@@ -94,7 +94,7 @@ fn count_files(tree: &Tree) -> (usize, usize) {
     }
 }
 
-pub fn index_dir(root: &Path, max_depth: usize, max_lines: usize) -> ! {
+pub(crate) fn index_dir(root: &Path, max_depth: usize, max_lines: usize) -> ! {
     let mut builder = WalkBuilder::new(root);
     builder
         .max_depth(Some(max_depth))

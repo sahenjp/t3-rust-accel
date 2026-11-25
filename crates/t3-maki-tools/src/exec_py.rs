@@ -5,8 +5,7 @@
 //! Helpers injected in the preamble let the script chain index/slice/grep/read
 //! inside the workspace and print only the compact result.
 
-use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -15,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::process::resolve_executable;
+use crate::process::{drain_capped, resolve_executable};
 use crate::text::head_tail_bytes;
 use crate::{emit, fail};
 
@@ -124,6 +123,8 @@ def glob_files(pattern, path="."):
     root = _abspath(path)
     out = []
     for fp in _iter_files(root):
+        if not _inside_workspace(_os.path.realpath(fp)):
+            continue
         rel = _os.path.relpath(fp, root)
         if _fnmatch_mod.fnmatch(rel, pattern) or _fnmatch_mod.fnmatch(_os.path.basename(fp), pattern):
             out.append(rel)
@@ -294,42 +295,7 @@ fn attach_job(child: &std::process::Child) -> std::io::Result<std::os::windows::
     Ok(job)
 }
 
-/// Read a pipe to EOF while retaining enough bytes for later head+tail
-/// truncation. The stream is always drained so the child never blocks on a
-/// full pipe. When more than `cap` bytes are emitted, the first half and the
-/// final half are retained rather than losing the ending diagnostics.
-fn drain_capped<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, u64) {
-    let head_cap = cap / 2;
-    let tail_cap = cap - head_cap;
-    let mut head = Vec::with_capacity(head_cap.min(8192));
-    let mut tail: VecDeque<u8> = VecDeque::with_capacity(tail_cap.min(8192));
-    let mut total = 0u64;
-    let mut buf = [0u8; 8192];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                total = total.saturating_add(n as u64);
-                let mut start = 0usize;
-                if head.len() < head_cap {
-                    let room = head_cap - head.len();
-                    let take = n.min(room);
-                    head.extend_from_slice(&buf[..take]);
-                    start = take;
-                }
-                if start < n {
-                    tail.extend(&buf[start..n]);
-                    while tail.len() > tail_cap {
-                        tail.pop_front();
-                    }
-                }
-            }
-        }
-    }
-    (head.into_iter().chain(tail).collect(), total)
-}
-
-pub fn cmd_exec(cwd: &str, timeout_ms: Option<u64>, max_bytes: usize, script: &[u8]) -> ! {
+pub(crate) fn cmd_exec(cwd: &str, timeout_ms: Option<u64>, max_bytes: usize, script: &[u8]) -> ! {
     let cwd_path = std::path::Path::new(cwd);
     if !cwd_path.is_dir() {
         fail(format!("--cwd is not a directory: {cwd}"));
@@ -381,12 +347,19 @@ pub fn cmd_exec(cwd: &str, timeout_ms: Option<u64>, max_bytes: usize, script: &[
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let out_thread = std::thread::spawn(move || drain_capped(stdout, MAX_CAPTURE_BYTES));
-    let err_thread = std::thread::spawn(move || drain_capped(stderr, MAX_CAPTURE_BYTES));
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = out_tx.send(drain_capped(stdout, MAX_CAPTURE_BYTES));
+    });
+    std::thread::spawn(move || {
+        let _ = err_tx.send(drain_capped(stderr, MAX_CAPTURE_BYTES));
+    });
 
-    // Feed the program; ignore EPIPE if the child exits early.
-    let _ = stdin.write_all(&program);
-    drop(stdin);
+    // Large scripts must not block the timeout loop on a full stdin pipe.
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(&program);
+    });
 
     let deadline = started + Duration::from_millis(timeout);
     let mut timed_out = false;
@@ -420,8 +393,12 @@ pub fn cmd_exec(cwd: &str, timeout_ms: Option<u64>, max_bytes: usize, script: &[
     #[cfg(windows)]
     drop(job);
 
-    let (stdout_bytes, stdout_total) = out_thread.join().unwrap_or_default();
-    let (stderr_bytes, stderr_total) = err_thread.join().unwrap_or_default();
+    let (stdout_bytes, stdout_total) = out_rx
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or_default();
+    let (stderr_bytes, stderr_total) = err_rx
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or_default();
     let duration_ms = started.elapsed().as_millis() as u64;
 
     let stdout_text = String::from_utf8_lossy(&stdout_bytes);

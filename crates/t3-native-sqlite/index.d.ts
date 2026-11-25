@@ -1,11 +1,12 @@
 export interface SqliteWorkerOpenOptions {
   filename: string;
-  readOnly: boolean;
-  requireWal: boolean;
+  readOnly?: boolean;
+  requireWal?: boolean;
   /** Prepared-statement LRU cache capacity. Default 200. */
   prepareCacheSize?: number;
   /** Bounded `PRAGMA cache_size` in KiB. Default 4000 for readers, 8000 for the writer. */
   cacheSizeKb?: number;
+  tempStore?: "DEFAULT" | "FILE" | "MEMORY";
 }
 
 export interface SqliteWorkerExecuteRequest {

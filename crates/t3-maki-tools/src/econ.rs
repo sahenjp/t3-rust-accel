@@ -6,30 +6,30 @@ use serde_json::json;
 use crate::{emit, fail};
 
 #[derive(Debug, Deserialize)]
-pub struct Prices {
-    pub input: f64,
-    pub output: f64,
-    pub cache_read: f64,
-    pub cache_write: f64,
+struct Prices {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct EconInput {
-    pub prefix: u64,
-    pub replaced: u64,
-    pub summary: u64,
-    pub tail: u64,
-    pub instruction: u64,
-    pub summarizer_reuses_prefix: bool,
-    pub prices: Prices,
+struct EconInput {
+    prefix: u64,
+    replaced: u64,
+    summary: u64,
+    tail: u64,
+    instruction: u64,
+    summarizer_reuses_prefix: bool,
+    prices: Prices,
     #[serde(default)]
-    pub remaining_turns: Option<f64>,
+    remaining_turns: Option<f64>,
 }
 
-pub struct BreakEven {
-    pub one_time_cost: f64,
-    pub saving_per_turn: f64,
-    pub turns: Option<f64>,
+struct BreakEven {
+    one_time_cost: f64,
+    saving_per_turn: f64,
+    turns: Option<f64>,
 }
 
 /// One compaction call's price = the summarizer call (read prefix+replaced at
@@ -37,7 +37,7 @@ pub struct BreakEven {
 /// instruction at input price, plus the summary at output price) + the cache
 /// rewrite of summary+tail at the fresh/cached spread.
 /// `saving_per_turn` = (replaced - summary) x cache-read price.
-pub fn break_even(input: &EconInput) -> BreakEven {
+fn break_even(input: &EconInput) -> BreakEven {
     let prices = &input.prices;
     let cached = prices.cache_read;
     let fresh = if prices.cache_write > 0.0 {
@@ -68,11 +68,26 @@ pub fn break_even(input: &EconInput) -> BreakEven {
     }
 }
 
-pub fn cmd_econ(stdin_json: &str) -> ! {
+pub(crate) fn cmd_econ(stdin_json: &str) -> ! {
     let input: EconInput = match serde_json::from_str(stdin_json) {
         Ok(v) => v,
         Err(e) => fail(format!("invalid econ input JSON: {e}")),
     };
+    for (name, value) in [
+        ("prices.input", input.prices.input),
+        ("prices.output", input.prices.output),
+        ("prices.cache_read", input.prices.cache_read),
+        ("prices.cache_write", input.prices.cache_write),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            fail(format!("{name} must be finite and >= 0"));
+        }
+    }
+    if let Some(remaining_turns) = input.remaining_turns {
+        if !remaining_turns.is_finite() || remaining_turns < 0.0 {
+            fail("remaining_turns must be finite and >= 0");
+        }
+    }
     let be = break_even(&input);
     let should_compact = match be.turns {
         Some(t) => t <= input.remaining_turns.unwrap_or(f64::INFINITY),

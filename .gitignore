@@ -1,5 +1,3 @@
-crates/t3-native-sqlite/*.node
-target/
-client-latest/
-node_modules/
+/target/
 /dist/
+node_modules/

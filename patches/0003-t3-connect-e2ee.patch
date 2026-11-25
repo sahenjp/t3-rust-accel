@@ -1,5 +1,5 @@
 diff --git a/apps/server/package.json b/apps/server/package.json
-index 89d5cef81770ce7104044af6350bf5a79f591f40..703c1e2f34acff22633823abd988c9509dbce5e3 100644
+index 89d5cef817..703c1e2f34 100644
 --- a/apps/server/package.json
 +++ b/apps/server/package.json
 @@ -75,6 +75,7 @@
@@ -19,7 +19,7 @@ index 89d5cef81770ce7104044af6350bf5a79f591f40..703c1e2f34acff22633823abd988c950
      "effect-acp": "workspace:*",
      "effect-codex-app-server": "workspace:*",
 diff --git a/apps/server/src/cli/connect.ts b/apps/server/src/cli/connect.ts
-index 8ef202c2d014f84587fc753498f2570d0bc76a51..193fb9f554e58ac29477e9975868c7caaca3e8b1 100644
+index 8ef202c2d0..193fb9f554 100644
 --- a/apps/server/src/cli/connect.ts
 +++ b/apps/server/src/cli/connect.ts
 @@ -1,6 +1,7 @@
@@ -41,7 +41,7 @@ index 8ef202c2d014f84587fc753498f2570d0bc76a51..193fb9f554e58ac29477e9975868c7ca
 @@ -816,8 +818,39 @@ const connectLogoutCommand = Command.make("logout", {
    ),
  );
-
+ 
 +const connectE2eeCommand = Command.make("e2ee", {
 +  endpoint: Flag.String("endpoint").pipe(
 +    Flag.withDescription("The HTTPS origin of the T3 Connect tunnel."),
@@ -79,7 +79,7 @@ index 8ef202c2d014f84587fc753498f2570d0bc76a51..193fb9f554e58ac29477e9975868c7ca
    connectLinkCommand,
    connectPublishCommand,
 diff --git a/apps/server/src/cloud/CloudLink.ts b/apps/server/src/cloud/CloudLink.ts
-index 6c9c70246b67e7b081f0eb088b37de40021bc1ff..1c25e084fe35534d02f4b113b64786dde4347582 100644
+index 6c9c70246b..1c25e084fe 100644
 --- a/apps/server/src/cloud/CloudLink.ts
 +++ b/apps/server/src/cloud/CloudLink.ts
 @@ -59,6 +59,7 @@ import * as Semaphore from "effect/Semaphore";
@@ -87,7 +87,7 @@ index 6c9c70246b67e7b081f0eb088b37de40021bc1ff..1c25e084fe35534d02f4b113b64786dd
  import type * as HttpClientError from "effect/http/HttpClientError";
  import * as HttpServer from "effect/http/HttpServer";
 +import { hostConfig as connectE2eeHostConfig } from "./connectE2ee.ts";
-
+ 
  import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
  import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 @@ -590,7 +591,8 @@ const make = Effect.gen(function* () {
@@ -109,7 +109,7 @@ index 6c9c70246b67e7b081f0eb088b37de40021bc1ff..1c25e084fe35534d02f4b113b64786dd
        try: () => parseManagedEndpointLocalOrigin(localOrigin),
        catch: () => new CloudLinkOriginInvalidError({ origin: "local" }),
 @@ -1584,6 +1587,8 @@ const make = Effect.gen(function* () {
-
+ 
    const mintCredential = Effect.fn("environment.cloud.mintCredential")(
      function* (request: RelayCloudMintCredentialRequest) {
 +      if (connectE2eeHostConfig())
@@ -119,10 +119,10 @@ index 6c9c70246b67e7b081f0eb088b37de40021bc1ff..1c25e084fe35534d02f4b113b64786dd
          .pipe(
 diff --git a/apps/server/src/cloud/connectE2ee.test.ts b/apps/server/src/cloud/connectE2ee.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..351a884a7cdd57cf028a338f1b5d1d1e346a4935
+index 0000000000..5bf0fda9a0
 --- /dev/null
 +++ b/apps/server/src/cloud/connectE2ee.test.ts
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,243 @@
 +// @effect-diagnostics nodeBuiltinImport:off globalFetch:off
 +import { execFileSync } from "node:child_process";
 +import { once } from "node:events";
@@ -212,6 +212,40 @@ index 0000000000000000000000000000000000000000..351a884a7cdd57cf028a338f1b5d1d1e
 +    "-out",
 +    "client-cert.pem",
 +  );
++  openssl(
++    "req",
++    "-new",
++    "-newkey",
++    "ec",
++    "-pkeyopt",
++    "ec_paramgen_curve:P-256",
++    "-nodes",
++    "-subj",
++    "/CN=wrong-purpose-client",
++    "-keyout",
++    "wrong-purpose-key.pem",
++    "-out",
++    "wrong-purpose.csr",
++  );
++  await writeFile(join(path, "wrong-purpose.ext"), "extendedKeyUsage=serverAuth\n");
++  openssl(
++    "x509",
++    "-req",
++    "-in",
++    "wrong-purpose.csr",
++    "-CA",
++    "ca-cert.pem",
++    "-CAkey",
++    "ca-key.pem",
++    "-set_serial",
++    "2",
++    "-days",
++    "1",
++    "-extfile",
++    "wrong-purpose.ext",
++    "-out",
++    "wrong-purpose-cert.pem",
++  );
 +  await copyFile(join(path, "ca-cert.pem"), join(path, "client-ca.pem"));
 +
 +  const edgeCert = await readFile(join(path, "edge-cert.pem"));
@@ -222,7 +256,13 @@ index 0000000000000000000000000000000000000000..351a884a7cdd57cf028a338f1b5d1d1e
 +  let backendRequests = 0;
 +  const backend = createHttpServer((request, reply) => {
 +    backendRequests++;
-+    reply.end(request.url === "/.well-known/t3/environment" ? "public descriptor" : payload);
++    reply.end(
++      request.url === "/.well-known/t3/environment"
++        ? "public descriptor"
++        : request.url === "/api/t3-connect/health"
++          ? "ok"
++          : payload,
++    );
 +  });
 +  const appSockets = new WebSocketServer({ server: backend, path: "/ws" });
 +  appSockets.on("connection", (socket) => socket.send(marker));
@@ -315,14 +355,23 @@ index 0000000000000000000000000000000000000000..351a884a7cdd57cf028a338f1b5d1d1e
 +  const untrusted = await startClient({ ...clientOptions, directory: missDirectory });
 +  cleanup.defer(untrusted.close);
 +  await expect(fetchPrivate(untrusted)).rejects.toThrow();
++
++  await Promise.all([
++    copyFile(join(path, "wrong-purpose-key.pem"), join(missDirectory, "client-key.pem")),
++    copyFile(join(path, "wrong-purpose-cert.pem"), join(missDirectory, "client-cert.pem")),
++    copyFile(join(path, "host-cert.pem"), join(missDirectory, "host-cert.pem")),
++  ]);
++  const wrongPurpose = await startClient({ ...clientOptions, directory: missDirectory });
++  cleanup.defer(wrongPurpose.close);
++  await expect(fetchPrivate(wrongPurpose)).rejects.toThrow();
 +  expect(backendRequests).toBe(3);
 +});
 diff --git a/apps/server/src/cloud/connectE2ee.ts b/apps/server/src/cloud/connectE2ee.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..913f3247beb3a83f540c210558d1381da7ed23ff
+index 0000000000..87f50ce9c4
 --- /dev/null
 +++ b/apps/server/src/cloud/connectE2ee.ts
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,279 @@
 +// The Node TLS stack authenticates peers over a WebSocket byte stream.
 +// @effect-diagnostics nodeBuiltinImport:off
 +import { X509Certificate } from "node:crypto";
@@ -379,6 +428,7 @@ index 0000000000000000000000000000000000000000..913f3247beb3a83f540c210558d1381d
 +    cert,
 +    ca,
 +    minVersion: "TLSv1.3" as const,
++    maxVersion: "TLSv1.3" as const,
 +    rejectUnauthorized: true,
 +  };
 +}
@@ -388,10 +438,29 @@ index 0000000000000000000000000000000000000000..913f3247beb3a83f540c210558d1381d
 +}
 +
 +function tunnelStream(socket: WebSocket) {
++  socket.on("error", () => {});
 +  socket.on("message", (_data, binary) => {
 +    if (!binary) socket.terminate();
 +  });
 +  return createWebSocketStream(socket);
++}
++
++async function boundedResponseBody(response: Response) {
++  if (response.body === null) return Buffer.alloc(0);
++  const reader = response.body.getReader();
++  const chunks: Buffer[] = [];
++  let size = 0;
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) break;
++    size += value.byteLength;
++    if (size > MAX_CONTROL_BYTES) {
++      await reader.cancel().catch(() => {});
++      return undefined;
++    }
++    chunks.push(Buffer.from(value));
++  }
++  return Buffer.concat(chunks);
 +}
 +
 +async function controlRequest(request: IncomingMessage, backend: URL) {
@@ -436,10 +505,16 @@ index 0000000000000000000000000000000000000000..913f3247beb3a83f540c210558d1381d
 +  const tls = createTlsServer(
 +    { ...credentials, requestCert: true, handshakeTimeout: HANDSHAKE_TIMEOUT },
 +    (socket) => {
++      const peer = socket.getPeerX509Certificate();
++      if (!peer || peer.ca || peer.keyUsage?.includes("1.3.6.1.5.5.7.3.2") !== true) {
++        socket.destroy();
++        return;
++      }
 +      const target = connectTcp(backendPort, backendHost);
 +      void bridge(socket, target);
 +    },
 +  );
++  tls.on("error", () => {});
 +  const websockets = new WebSocketServer({ ...WS_OPTIONS, noServer: true });
 +  const ingress = createHttpServer(
 +    {
@@ -451,7 +526,12 @@ index 0000000000000000000000000000000000000000..913f3247beb3a83f540c210558d1381d
 +      reply.setHeader("cache-control", "no-store");
 +      void controlRequest(request, backend)
 +        .then(async (response) => {
-+          const contents = Buffer.from(await response.arrayBuffer());
++          const contents = await boundedResponseBody(response);
++          if (contents === undefined) {
++            reply.statusCode = 502;
++            reply.end();
++            return;
++          }
 +          reply.statusCode = response.status;
 +          const contentType = response.headers.get("content-type");
 +          if (contentType) reply.setHeader("content-type", contentType);
@@ -572,7 +652,7 @@ index 0000000000000000000000000000000000000000..913f3247beb3a83f540c210558d1381d
 +  };
 +}
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index 916cca3109bc1b64221181aee35f5308c009fe87..d888ef496aa9d55962c7bce77907f7ab06e5a4ef 100644
+index 916cca3109..d888ef496a 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
 @@ -3,6 +3,7 @@ import * as DatabaseMigrationProgress from "./persistence/DatabaseMigrationProgr
@@ -616,7 +696,7 @@ index 916cca3109bc1b64221181aee35f5308c009fe87..d888ef496aa9d55962c7bce77907f7ab
              const runManagedTunnelRecovery = yield* makeManagedTunnelRecovery({
                recover: (config: RelayManagedEndpointRuntimeConfig) =>
 diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
-index 5f1afcad90b3e1b959347b3788fb7136e4fce639..1125fe285e399b96c6875d3373ab1df69d71f73b 100644
+index 5f1afcad90..1125fe285e 100644
 --- a/pnpm-lock.yaml
 +++ b/pnpm-lock.yaml
 @@ -977,6 +977,9 @@ importers:

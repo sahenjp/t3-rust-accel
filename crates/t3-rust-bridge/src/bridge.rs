@@ -32,7 +32,7 @@ const SSE_SEPARATOR_OVERLAP: usize = 3;
 // ---------------------------------------------------------------------------
 
 /// Serialize a `serde_json::Value` the way `JSON.stringify` would.
-pub fn js_stringify(value: &Value) -> String {
+pub(crate) fn js_stringify(value: &Value) -> String {
     let mut out = String::new();
     write_js(value, &mut out);
     out
@@ -622,7 +622,7 @@ async fn wait_done(mut done: watch::Receiver<bool>) {
 /// stdin is split on `\n` only, `initialize`/`notifications/initialized`
 /// serialize through a session barrier, JSON-RPC responses bypass it, and all
 /// other messages run concurrently after any pending barrier completes.
-pub async fn run_bridge<R, W>(
+pub(crate) async fn run_bridge<R, W>(
     endpoint: String,
     authorization: String,
     mut input: R,
@@ -710,7 +710,11 @@ pub async fn run_bridge<R, W>(
         };
         let slots_available = tasks.len() < MAX_IN_FLIGHT_REQUESTS;
         let permit = slots_available
-            .then(|| bytes.clone().try_acquire_many_owned(line.len() as u32).ok())
+            .then(|| {
+                u32::try_from(line.len())
+                    .ok()
+                    .and_then(|len| bytes.clone().try_acquire_many_owned(len).ok())
+            })
             .flatten();
         let Some(permit) = permit else {
             if let Some(id) = id.filter(|_| !is_response) {
@@ -784,8 +788,8 @@ pub async fn run_bridge<R, W>(
 
 /// Error carrying the same message text as `AcpMcpBridgeError`.
 #[derive(Debug)]
-pub struct BridgeError {
-    pub message: String,
+pub(crate) struct BridgeError {
+    message: String,
 }
 
 impl BridgeError {
@@ -924,7 +928,7 @@ async fn session_request(
 /// tools/call, then DELETE the session whenever a session id was issued.
 /// Returns the `tools/call` envelope's `result` member, or `None` when the
 /// server omitted it (prints as `undefined` upstream).
-pub async fn acp_mcp_call(
+pub(crate) async fn acp_mcp_call(
     endpoint: &str,
     authorization: &str,
     tool: &str,
@@ -983,7 +987,7 @@ pub async fn acp_mcp_call(
 
 /// Drop `content` text parts that merely duplicate `structuredContent`,
 /// matching the filter in `runAcpMcpCliFastPath`.
-pub fn dedup_structured_content(result: &mut Value) {
+pub(crate) fn dedup_structured_content(result: &mut Value) {
     let Some(object) = result.as_object_mut() else {
         return;
     };
@@ -1006,4 +1010,5 @@ pub fn dedup_structured_content(result: &mut Value) {
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;

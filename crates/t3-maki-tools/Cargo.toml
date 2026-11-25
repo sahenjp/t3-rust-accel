@@ -2,16 +2,12 @@
 name = "t3-maki-tools"
 version = "0.1.0"
 edition = "2021"
-description = "Maki-grade tree-sitter index/slice, resource-limited local exec pipeline runner, and dsh native_compaction econ/prune CLI invoked on-demand by T3 Code's MCP server"
+description = "Maki-grade tree-sitter index/slice, resource-limited local exec pipeline runner, and dsh native_compaction econ CLI invoked on-demand by T3 Code's MCP server"
 license = "MIT"
 
 [[bin]]
 name = "t3-maki-tools"
 path = "src/main.rs"
-
-[lib]
-name = "t3_maki_tools"
-path = "src/lib.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -35,9 +31,3 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
-
-[profile.release]
-opt-level = "s"
-lto = "thin"
-strip = true
-codegen-units = 1

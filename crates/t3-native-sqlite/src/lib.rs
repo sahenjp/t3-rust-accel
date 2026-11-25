@@ -6,7 +6,7 @@
 //! `startCheckpointWorker`: `NativeSqliteWorker`, `NativeCheckpointWorker`,
 //! `sqliteVersion`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -301,7 +301,9 @@ fn decode_single(env: &Env, value: sys::napi_value) -> Result<SqlValue> {
       let mut number = 0.0;
       check_status!(unsafe { sys::napi_get_value_double(raw, value, &mut number) })?;
       // i64::MAX rounds to 2^63 as an f64, so the upper bound is exclusive.
-      if number.fract() == 0.0 && number >= i64::MIN as f64 && number < i64::MAX as f64 {
+      if number == 0.0 && number.is_sign_negative() {
+        Ok(SqlValue::Real(number))
+      } else if number.fract() == 0.0 && number >= i64::MIN as f64 && number < i64::MAX as f64 {
         Ok(SqlValue::Integer(number as i64))
       } else {
         Ok(SqlValue::Real(number))
@@ -374,7 +376,11 @@ fn decode_params(env: &Env, params: Option<sys::napi_value>) -> Result<BindParam
   }
   let mut out = Vec::with_capacity(length as usize);
   for index in 0..length {
-    out.push(decode_single(env, get(index)?)?);
+    let decoded = env.run_in_scope(|| {
+      let element = get(index)?;
+      decode_single(env, element)
+    })?;
+    out.push(decoded);
   }
   Ok(BindParams::Positional(out))
 }
@@ -399,14 +405,18 @@ fn decode_named(env: &Env, object: sys::napi_value) -> Result<BindParams> {
   }
   let mut out = HashMap::with_capacity(length as usize);
   for i in 0..length {
-    let mut key = ptr::null_mut();
-    check_status!(unsafe { sys::napi_get_element(raw, names, i, &mut key) })?;
-    let name = decode_string(raw, key)?;
-    let mut element = ptr::null_mut();
-    check_pending_exception!(raw, unsafe {
-      sys::napi_get_property(raw, object, key, &mut element)
+    let (name, decoded) = env.run_in_scope(|| {
+      let mut key = ptr::null_mut();
+      check_status!(unsafe { sys::napi_get_element(raw, names, i, &mut key) })?;
+      let name = decode_string(raw, key)?;
+      let mut element = ptr::null_mut();
+      check_pending_exception!(raw, unsafe {
+        sys::napi_get_property(raw, object, key, &mut element)
+      })?;
+      let decoded = decode_single(env, element)?;
+      Ok((name, decoded))
     })?;
-    out.insert(name, decode_single(env, element)?);
+    out.insert(name, decoded);
   }
   Ok(BindParams::Named(out))
 }
@@ -455,17 +465,40 @@ fn bind_params(stmt: &mut Statement, params: &BindParams) -> std::result::Result
     }
     BindParams::Named(entries) => {
       let count = stmt.parameter_count();
-      for index in 1..=count {
-        let Some(name) = stmt.parameter_name(index) else {
-          continue;
-        };
+      let parameter_names: Vec<(usize, String)> = (1..=count)
+        .filter_map(|index| {
+          stmt
+            .parameter_name(index)
+            .map(|name| (index, name.to_owned()))
+        })
+        .collect();
+      {
+        let mut accepted = HashSet::with_capacity(parameter_names.len() * 2);
+        for (_, name) in &parameter_names {
+          let name = name.as_str();
+          let bare = name.chars().next().map_or(name, |c| &name[c.len_utf8()..]);
+          accepted.insert(name);
+          accepted.insert(bare);
+        }
+        if let Some(key) = entries
+          .keys()
+          .find(|key| !accepted.contains(key.as_str()))
+        {
+          return Err(SqlErr::plain(
+            "execute",
+            format!("unknown named parameter '{key}'"),
+          ));
+        }
+      }
+      for (index, name) in &parameter_names {
+        let name = name.as_str();
         // node:sqlite: ":x" matches object keys ":x" or bare "x".
-        let bare = &name[1..];
+        let bare = name.chars().next().map_or(name, |c| &name[c.len_utf8()..]);
         let value = entries
           .get(name)
           .or_else(|| entries.get(bare))
           .unwrap_or(&SqlValue::Null);
-        stmt.raw_bind_parameter(index, value).map_err(exec_err)?;
+        stmt.raw_bind_parameter(*index, value).map_err(exec_err)?;
       }
     }
   }
@@ -663,6 +696,14 @@ impl ToNapiValue for QueryResult {
         arrays,
         safe,
       } => {
+        if rows.len() > u32::MAX as usize
+          || rows.iter().any(|row| row.len() > u32::MAX as usize)
+        {
+          return Err(Error::new(
+            Status::GenericFailure,
+            "query result exceeds the N-API element limit".to_owned(),
+          ));
+        }
         let mut out = ptr::null_mut();
         check_status!(
           sys::napi_create_array_with_length(env, rows.len(), &mut out),
@@ -733,12 +774,18 @@ enum Job {
   Close,
 }
 
+struct WorkerState {
+  sender: Option<Sender<Job>>,
+  join: Option<JoinHandle<()>>,
+}
+
 fn open_connection(
   filename: &str,
   read_only: bool,
   require_wal: bool,
   prepare_cache_size: usize,
   cache_size_kb: u32,
+  temp_store: Option<String>,
 ) -> std::result::Result<Connection, SqlErr> {
   let conn = if read_only {
     Connection::open_with_flags(
@@ -749,9 +796,12 @@ fn open_connection(
     Connection::open(filename)
   }
   .map_err(|e| SqlErr::sqlite("open", e))?;
+  let temp_store_pragma = temp_store
+    .map(|mode| format!(" PRAGMA temp_store = {mode};"))
+    .unwrap_or_default();
   conn
     .execute_batch(&format!(
-      "PRAGMA busy_timeout = 5000; PRAGMA cache_size = -{cache_size_kb};"
+      "PRAGMA busy_timeout = 5000; PRAGMA cache_size = -{cache_size_kb};{temp_store_pragma}"
     ))
     .map_err(|e| SqlErr::sqlite("open", e))?;
   conn.set_prepared_statement_cache_capacity(prepare_cache_size);
@@ -771,7 +821,11 @@ fn worker_loop(conn: Connection, rx: Receiver<Job>) {
   for job in rx {
     match job {
       Job::Execute { req, deferred } => {
-        settle(deferred, execute_request(&conn, &req));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+          execute_request(&conn, &req)
+        }))
+        .unwrap_or_else(|_| Err(SqlErr::plain("execute", "database worker panicked")));
+        settle(deferred, outcome);
       }
       Job::Close => {
         // Dropping the connection lets SQLite checkpoint and remove the WAL.
@@ -784,8 +838,7 @@ fn worker_loop(conn: Connection, rx: Receiver<Job>) {
 
 #[napi]
 pub struct NativeSqliteWorker {
-  sender: Mutex<Option<Sender<Job>>>,
-  join: Arc<Mutex<Option<JoinHandle<()>>>>,
+  state: Arc<Mutex<WorkerState>>,
 }
 
 #[napi]
@@ -810,16 +863,32 @@ pub fn open_sqlite_worker(env: Env, options: Object) -> Result<NapiValue> {
   let require_wal = options.get::<bool>("requireWal")?.unwrap_or(false);
   let prepare_cache_size = options.get::<u32>("prepareCacheSize")?.unwrap_or(200) as usize;
   // Readers keep 4 MiB of page cache, the writer keeps 8 MiB.
-  let cache_size_kb =
-    options
-      .get::<u32>("cacheSizeKb")?
-      .unwrap_or(if read_only { 4000 } else { 8000 });
+  let cache_size_kb = options
+    .get::<u32>("cacheSizeKb")?
+    .unwrap_or(if read_only { 4000 } else { 8000 })
+    .min(1_048_576);
+  let temp_store = options
+    .get::<String>("tempStore")?
+    .map(|mode| {
+      let mode = mode.to_ascii_uppercase();
+      match mode.as_str() {
+        "DEFAULT" | "FILE" | "MEMORY" => Ok(mode),
+        _ => Err(Error::new(
+          Status::InvalidArg,
+          "tempStore must be DEFAULT, FILE, or MEMORY".to_owned(),
+        )),
+      }
+    })
+    .transpose()?;
 
   let (deferred, promise) =
     env.create_deferred::<NativeSqliteWorker, Resolve<NativeSqliteWorker>>()?;
-  let join_slot = Arc::new(Mutex::new(None::<JoinHandle<()>>));
-  let join_for_worker = join_slot.clone();
   let (tx, rx) = channel::<Job>();
+  let worker_state = Arc::new(Mutex::new(WorkerState {
+    sender: Some(tx),
+    join: None,
+  }));
+  let state_for_worker = worker_state.clone();
 
   let handle = thread::Builder::new()
     .name("t3-native-sqlite-worker".to_owned())
@@ -830,12 +899,12 @@ pub fn open_sqlite_worker(env: Env, options: Object) -> Result<NapiValue> {
         require_wal,
         prepare_cache_size,
         cache_size_kb,
+        temp_store,
       ) {
         Ok(conn) => {
           deferred.resolve(Box::new(move |_env| {
             Ok(NativeSqliteWorker {
-              sender: Mutex::new(Some(tx)),
-              join: join_for_worker,
+              state: state_for_worker,
             })
           }));
           worker_loop(conn, rx);
@@ -844,7 +913,7 @@ pub fn open_sqlite_worker(env: Env, options: Object) -> Result<NapiValue> {
       }
     })
     .map_err(|e| Error::new(Status::GenericFailure, format!("spawn failed: {e}")))?;
-  *join_slot.lock().expect("join lock poisoned") = Some(handle);
+  worker_state.lock().expect("worker state lock poisoned").join = Some(handle);
   Ok(NapiValue(promise.raw()))
 }
 
@@ -869,10 +938,12 @@ impl NativeSqliteWorker {
     };
     let (deferred, promise) = env.create_deferred::<QueryResult, Resolve<QueryResult>>()?;
     let job = Job::Execute { req, deferred };
-    let sender = self.sender.lock().expect("sender lock poisoned");
-    let returned = match sender.as_ref() {
-      Some(tx) => tx.send(job).err().map(|err| err.0),
-      None => Some(job),
+    let returned = {
+      let state = self.state.lock().expect("worker state lock poisoned");
+      match state.sender.as_ref() {
+        Some(tx) => tx.send(job).err().map(|err| err.0),
+        None => Some(job),
+      }
     };
     if let Some(Job::Execute { deferred, .. }) = returned {
       settle(
@@ -886,8 +957,10 @@ impl NativeSqliteWorker {
   #[napi]
   pub fn close(&self, env: Env) -> Result<NapiValue> {
     let (deferred, promise) = env.create_deferred::<(), Resolve<()>>()?;
-    let sender = self.sender.lock().expect("sender lock poisoned").take();
-    let handle = self.join.lock().expect("join lock poisoned").take();
+    let (sender, handle) = {
+      let mut state = self.state.lock().expect("worker state lock poisoned");
+      (state.sender.take(), state.join.take())
+    };
     if let Some(tx) = sender {
       let _ = tx.send(Job::Close);
     }

@@ -8,13 +8,13 @@ use tree_sitter::{Language, Node, Parser};
 use crate::fail;
 
 /// Maki `max_file_size_mb = 2` default.
-pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// Bound recursive AST walks so adversarial deeply nested source cannot
 /// overflow the CLI process stack. Real-world definitions are far shallower.
 const MAX_AST_WALK_DEPTH: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Lang {
+pub(crate) enum Lang {
     Rust,
     TypeScript,
     Tsx,
@@ -34,7 +34,7 @@ pub enum Lang {
 }
 
 impl Lang {
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Lang::Rust => "rust",
             Lang::TypeScript => "typescript",
@@ -55,7 +55,7 @@ impl Lang {
         }
     }
 
-    pub fn from_path(path: &Path) -> Lang {
+    pub(crate) fn from_path(path: &Path) -> Lang {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -81,7 +81,7 @@ impl Lang {
         }
     }
 
-    pub fn is_tree_sitter(self) -> bool {
+    pub(crate) fn is_tree_sitter(self) -> bool {
         !matches!(
             self,
             Lang::Markdown | Lang::Toml | Lang::Yaml | Lang::Sql | Lang::Text
@@ -106,7 +106,7 @@ impl Lang {
     }
 }
 
-pub fn parse(lang: Lang, src: &str) -> Option<tree_sitter::Tree> {
+fn parse(lang: Lang, src: &str) -> Option<tree_sitter::Tree> {
     let mut parser = Parser::new();
     parser.set_language(&lang.grammar()?).ok()?;
     parser.parse(src, None)
@@ -261,6 +261,16 @@ fn act(lang: Lang, node: &Node, src: &str) -> Act {
         },
         Lang::C => match k {
             "preproc_include" => Act::Import,
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else" => Act::Unwrap,
+            "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier" => {
+                if has_body(node) {
+                    Act::Container
+                } else if node.child_by_field_name("name").is_some() {
+                    Act::Leaf
+                } else {
+                    Act::Skip
+                }
+            }
             "declaration" => match node.named_child(0).map(|c| c.kind()) {
                 Some("struct_specifier") | Some("union_specifier") | Some("enum_specifier") => {
                     if has_body(node) {
@@ -281,7 +291,17 @@ fn act(lang: Lang, node: &Node, src: &str) -> Act {
         },
         Lang::Cpp => match k {
             "preproc_include" => Act::Import,
+            "preproc_ifdef" | "preproc_if" | "preproc_elif" | "preproc_else" => Act::Unwrap,
             "template_declaration" | "linkage_specification" | "export_statement" => Act::Unwrap,
+            "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier" => {
+                if has_body(node) {
+                    Act::Container
+                } else if node.child_by_field_name("name").is_some() {
+                    Act::Leaf
+                } else {
+                    Act::Skip
+                }
+            }
             "namespace_definition" => {
                 if has_body(node) {
                     Act::Container
@@ -292,7 +312,10 @@ fn act(lang: Lang, node: &Node, src: &str) -> Act {
             "declaration" => {
                 // `class Foo { ... };` surfaces as declaration > class_specifier.
                 match node.named_child(0).map(|c| c.kind()) {
-                    Some("class_specifier") | Some("union_specifier") | Some("enum_specifier") => {
+                    Some("struct_specifier")
+                    | Some("class_specifier")
+                    | Some("union_specifier")
+                    | Some("enum_specifier") => {
                         if has_body(node) {
                             Act::Container
                         } else {
@@ -408,7 +431,7 @@ fn text_of(node: &Node, src: &str) -> String {
 }
 
 /// Extract the declared name of a node (for `slice --symbol`).
-pub fn node_name(node: &Node, src: &str) -> Option<String> {
+fn node_name(node: &Node, src: &str) -> Option<String> {
     if let Some(n) = node.child_by_field_name("name") {
         return Some(text_of(&n, src));
     }
@@ -421,7 +444,22 @@ pub fn node_name(node: &Node, src: &str) -> Option<String> {
             .named_child(0)
             .and_then(|s| s.child_by_field_name("name"))
             .map(|n| text_of(&n, src)),
-        "function_definition" | "declaration" => c_decl_name(*node, src),
+        "function_definition" => c_decl_name(*node, src),
+        "declaration" => c_decl_name(*node, src).or_else(|| {
+            node.named_child(0)
+                .filter(|child| {
+                    matches!(
+                        child.kind(),
+                        "struct_specifier"
+                            | "class_specifier"
+                            | "union_specifier"
+                            | "enum_specifier"
+                    )
+                })
+                .and_then(|specifier| specifier.child_by_field_name("name"))
+                .map(|name| text_of(&name, src))
+        }),
+        "field_declaration" => c_decl_name(*node, src),
         "type_definition" => node
             .child_by_field_name("declarator")
             .and_then(|d| declarator_ident(d, src)),
@@ -650,12 +688,11 @@ fn text_outline(lang: Lang, src: &str, entries: &mut Vec<Entry>) {
     }
 }
 
-pub struct Skeleton {
-    pub language: Lang,
-    pub text: String,
-    pub line_count: usize,
-    pub symbol_count: usize,
-    pub truncated: bool,
+struct Skeleton {
+    text: String,
+    line_count: usize,
+    symbol_count: usize,
+    truncated: bool,
 }
 
 fn outline_entries(lang: Lang, src: &str) -> Vec<Entry> {
@@ -684,7 +721,7 @@ pub(crate) fn count_symbols(lang: Lang, src: &str) -> usize {
 }
 
 /// Build the skeleton for `src` parsed as `lang`, capped at `max_lines`.
-pub fn build_skeleton(lang: Lang, src: &str, max_lines: usize) -> Skeleton {
+fn build_skeleton(lang: Lang, src: &str, max_lines: usize) -> Skeleton {
     let line_count = src.lines().count();
     let entries = outline_entries(lang, src);
     let mut lines: Vec<String> = Vec::new();
@@ -732,7 +769,6 @@ pub fn build_skeleton(lang: Lang, src: &str, max_lines: usize) -> Skeleton {
         truncated = true;
     }
     Skeleton {
-        language: lang,
         text: lines.join("\n"),
         line_count,
         symbol_count,
@@ -742,13 +778,11 @@ pub fn build_skeleton(lang: Lang, src: &str, max_lines: usize) -> Skeleton {
 
 // ---------------- symbol search for `slice` ----------------
 
-pub struct SymMatch {
-    pub qualified: String,
-    pub name: String,
-    pub start_line: usize,
-    pub end_line: usize,
-    pub byte_start: usize,
-    pub byte_end: usize,
+pub(crate) struct SymMatch {
+    pub(crate) qualified: String,
+    pub(crate) name: String,
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
 }
 
 /// Kinds whose members get `<Container>::` qualified names.
@@ -768,9 +802,9 @@ fn container_name(lang: Lang, node: &Node, src: &str) -> Option<String> {
         Lang::Python => matches!(k, "class_definition"),
         Lang::Cpp => matches!(
             k,
-            "namespace_definition" | "class_specifier" | "union_specifier"
+            "namespace_definition" | "struct_specifier" | "class_specifier" | "union_specifier"
         ),
-        Lang::C => matches!(k, "struct_specifier" | "enum_specifier"),
+        Lang::C => matches!(k, "struct_specifier" | "union_specifier" | "enum_specifier"),
         _ => false,
     };
     if is_container {
@@ -816,8 +850,6 @@ fn push_match(n: &Node, src: &str, ancestors: &[String], out: &mut Vec<SymMatch>
         name,
         start_line: ext.start_position().row + 1,
         end_line: n.end_position().row + 1,
-        byte_start: ext.start_byte(),
-        byte_end: n.end_byte(),
     });
 }
 
@@ -892,7 +924,7 @@ fn extend_start<'a>(node: Node<'a>) -> Node<'a> {
 
 /// Every named definition-like symbol in `src`, in source order.
 /// Used by `grep` to annotate matches with their enclosing symbol.
-pub fn all_symbols(lang: Lang, src: &str) -> Vec<SymMatch> {
+pub(crate) fn all_symbols(lang: Lang, src: &str) -> Vec<SymMatch> {
     let Some(tree) = parse(lang, src) else {
         return Vec::new();
     };
@@ -901,7 +933,7 @@ pub fn all_symbols(lang: Lang, src: &str) -> Vec<SymMatch> {
     out
 }
 
-pub fn find_symbols(lang: Lang, src: &str, query: &str) -> Vec<SymMatch> {
+pub(crate) fn find_symbols(lang: Lang, src: &str, query: &str) -> Vec<SymMatch> {
     let Some(tree) = parse(lang, src) else {
         return Vec::new();
     };
@@ -921,7 +953,7 @@ pub fn find_symbols(lang: Lang, src: &str, query: &str) -> Vec<SymMatch> {
 }
 
 /// Read a file, refusing > 2 MiB (Maki max_file_size_mb default).
-pub fn read_source(path: &Path) -> Result<String, Value> {
+pub(crate) fn read_source(path: &Path) -> Result<String, Value> {
     let meta = std::fs::metadata(path).map_err(
         |e| json!({"ok": false, "error": format!("cannot stat {}: {e}", path.display())}),
     )?;
@@ -937,13 +969,13 @@ pub fn read_source(path: &Path) -> Result<String, Value> {
         .map_err(|e| json!({"ok": false, "error": format!("cannot read {}: {e}", path.display())}))
 }
 
-pub fn die(v: Value) -> ! {
+pub(crate) fn die(v: Value) -> ! {
     crate::emit(&v);
     std::process::exit(1);
 }
 
 /// `index --path` file mode.
-pub fn cmd_index(path: &str, max_depth: usize, max_lines: usize) -> ! {
+pub(crate) fn cmd_index(path: &str, max_depth: usize, max_lines: usize) -> ! {
     let p = Path::new(path);
     if !p.exists() {
         fail(format!("path does not exist: {path}"));

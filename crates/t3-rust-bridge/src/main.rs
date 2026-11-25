@@ -1,8 +1,10 @@
+mod bridge;
+
 use std::io::Read;
 use std::sync::Arc;
 
+use bridge::{acp_mcp_call, dedup_structured_content, js_stringify, run_bridge};
 use serde_json::Value;
-use t3_rust_bridge::{acp_mcp_call, dedup_structured_content, js_stringify, run_bridge};
 use tokio::sync::Mutex;
 
 const MAX_ARGUMENTS_BYTES: u64 = 64 * 1024 * 1024;

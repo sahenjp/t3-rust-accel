@@ -48,7 +48,7 @@ node --test crates/t3-native-sqlite/test.mjs scripts/t3-accel.test.mjs
 
 GitHub Actions のビルド対象は Linux と macOS の x64・arm64、および Windows x64 です。Linux 版は Debian 12 のコンテナでビルドし、Debian 12 と 13 で展開と起動をテストします。macOS 版と Windows 版は各 OS のランナーでテストします。
 
-バージョンタグ（例 `v1.2.3`）を push すると、全プラットフォームのテストに合格した配布ファイルと `SHA256SUMS` を GitHub Release にまとめます。利用する OS と CPU に合うアーカイブを選び、展開前に SHA-256 を照合します。GitHub CLI の `gh attestation verify <archive> --repo sahenjp/t3-rust-accel` でビルドの来歴も確認できます。
+バージョンタグ（例 `v1.2.3`）を push すると、全プラットフォームのテストに合格した配布ファイルと `SHA256SUMS` を GitHub Release にまとめます。利用する OS と CPU に合うアーカイブを選び、展開前に SHA-256 を照合します。配布アーカイブにはビルド済みの実行ファイルと SQLite アドオンが入っているため、`build` は不要で展開ディレクトリからそのまま `node scripts/t3-accel.mjs serve <server/bin.mjs>` を実行できます。GitHub CLI の `gh attestation verify <archive> --repo sahenjp/t3-rust-accel` でビルドの来歴も確認できます。
 
 ### macOS
 
@@ -89,17 +89,17 @@ Environment=T3CODE_OTEL_SDK_DISABLED=true
 
 この設定で、製品テレメトリ (`ingest.t3.codes`) と relay の OTLP tracing が止まり、環境変数を継承するバンドルエージェントの analytics connect-RPC も止まります。
 
-ソースの `patches/0001-telemetry-opt-in-by-default.patch` を適用すると、環境変数の指定がない場合もテレメトリは無効です。続く `patches/0002-scope-mcp-registration-buffer.patch` は、`T3_DEFER_MCP_TOOLS` や `T3_STATIC_TOOL_LIST` を使う際の MCP 登録エラーを修正します。
+ソースの `patches/0001-telemetry-opt-in-by-default.patch` を適用すると、環境変数の指定がない場合もテレメトリは無効です。
 
 ## Antigravity の接続
 
-サーバのソースに `patches/0003-use-installed-antigravity-cli.patch` を適用した状態で接続します。Google 公式の `agy` を別途インストールし、T3 Code のプロバイダ設定に実行ファイルのパスを指定するか、サーバの `PATH` に含めます。
+サーバのソースに `patches/0002-use-installed-antigravity-cli.patch` を適用した状態で接続します。Google 公式の `agy` を別途インストールし、T3 Code のプロバイダ設定に実行ファイルのパスを指定するか、サーバの `PATH` に含めます。
 
 T3 Code は公式 CLI を介して認証とセッションを扱います。利用履歴はローカルファイルから読み取ります。残りクォータの表示と、T3 Code からの CLI の自動ダウンロードは無効です。
 
 ## T3 Connect のエンドツーエンド暗号化
 
-`0004` のパッチは T3 Connect の管理トンネルに TLS 1.3 の通信を通します。
+`patches/0003-t3-connect-e2ee.patch` は T3 Connect の管理トンネルに TLS 1.3 の通信を通します。
 Cloudflare の入口には暗号化済みの WebSocket フレームが届きます。
 クライアントは事前に受け取ったホスト証明書と照合し、ホストはクライアント証明書を検証します。
 

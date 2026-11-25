@@ -22,15 +22,13 @@ const bridge = join(release, `t3-rust-bridge${exe}`);
 const maki = join(release, `t3-maki-tools${exe}`);
 
 function build() {
-  for (const name of ["t3-rust-bridge", "t3-maki-tools", "t3-native-sqlite"]) {
-    const result = spawnSync("cargo", [
-      "build", "--locked", "--release", "--manifest-path",
-      join(root, "crates", name, "Cargo.toml"), "--target-dir", target,
-      ...(macTarget === undefined ? [] : ["--target", macTarget]),
-    ], { cwd: root, stdio: "inherit" });
-    if (result.error) throw result.error;
-    if (result.status !== 0) return result.status ?? 1;
-  }
+  const result = spawnSync("cargo", [
+    "build", "--workspace", "--locked", "--release", "--manifest-path",
+    join(root, "Cargo.toml"), "--target-dir", target,
+    ...(macTarget === undefined ? [] : ["--target", macTarget]),
+  ], { cwd: root, stdio: "inherit" });
+  if (result.error) throw result.error;
+  if (result.status !== 0) return result.status ?? 1;
 
   const library = win ? "t3_native_sqlite.dll" : process.platform === "darwin"
     ? "libt3_native_sqlite.dylib"
@@ -55,9 +53,8 @@ function packageBuild(outputPath) {
       sqliteModule, join(sqlite, "index.d.ts"),
       join(root, "patches/0000-integrate-rust-accelerator.patch"),
       join(root, "patches/0001-telemetry-opt-in-by-default.patch"),
-      join(root, "patches/0002-scope-mcp-registration-buffer.patch"),
-      join(root, "patches/0003-use-installed-antigravity-cli.patch"),
-      join(root, "patches/0004-t3-connect-e2ee.patch"),
+      join(root, "patches/0002-use-installed-antigravity-cli.patch"),
+      join(root, "patches/0003-t3-connect-e2ee.patch"),
       join(root, "patches/T3CODE-LICENSE"),
     ]) {
       const copy = join(packageRoot, relative(root, file));

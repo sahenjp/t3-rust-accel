@@ -105,6 +105,39 @@ test("positional + named params", async () => {
   assert.deepEqual(c, [{ v: 7 }]);
 });
 
+test("unknown named parameters reject as execute errors", async () => {
+  await assert.rejects(
+    exec(writer, "SELECT $x", { params: [{ x: 1, extra: 2 }] }),
+    (error) =>
+      error.operation === "execute" &&
+      error.code === "ERR_SQLITE_ERROR" &&
+      error.message.includes("unknown named parameter 'extra'"),
+  );
+});
+
+test("-0 binds as real while 0 binds as integer", async () => {
+  const negative = await exec(writer, "SELECT typeof(?1) AS type, ?1 AS value", { params: [-0] });
+  assert.equal(negative[0].type, "real");
+  assert(Object.is(negative[0].value, -0));
+  const zero = await exec(writer, "SELECT typeof(?1) AS type, ?1 AS value", { params: [0] });
+  assert.equal(zero[0].type, "integer");
+  assert(Object.is(zero[0].value, 0));
+});
+
+test("tempStore FILE sets PRAGMA temp_store to 1", async () => {
+  const worker = await NativeSqliteWorker.open({
+    filename: dbFile,
+    readOnly: true,
+    requireWal: true,
+    tempStore: "FILE",
+  });
+  try {
+    assert.deepEqual(await exec(worker, "PRAGMA temp_store"), [{ temp_store: 1 }]);
+  } finally {
+    await worker.close();
+  }
+});
+
 test("Uint8Array BLOB roundtrip + param types", async () => {
   const blob = new Uint8Array([0, 1, 2, 255, 128]);
   await exec(writer, "INSERT INTO t(name, data) VALUES (?, ?)", {
@@ -117,6 +150,16 @@ test("Uint8Array BLOB roundtrip + param types", async () => {
     params: [null, 1.5, "txt", true, undefined],
   });
   assert.deepEqual(types, [{ n: null, r: 1.5, s: "txt", b: 1, u: null }]);
+});
+
+test("detached ArrayBuffer view binds as an empty BLOB", async () => {
+  const backing = new ArrayBuffer(4);
+  const view = new Uint8Array(backing);
+  backing.transfer();
+  assert.equal(view.byteLength, 0);
+  const [[data]] = await exec(writer, "SELECT ?", { params: [view], values: true });
+  assert(data instanceof Uint8Array);
+  assert.equal(data.byteLength, 0);
 });
 
 test("empty BLOBs, offset views and float16 buffers", async () => {

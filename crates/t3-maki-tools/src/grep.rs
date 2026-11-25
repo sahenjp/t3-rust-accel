@@ -98,7 +98,7 @@ fn search_file(
     total
 }
 
-pub fn cmd_grep(
+pub(crate) fn cmd_grep(
     pattern: &str,
     path: &str,
     glob: Option<&str>,
