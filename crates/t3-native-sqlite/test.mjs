@@ -89,6 +89,21 @@ test("safeIntegers returns bigint", async () => {
   assert.equal(typeof rows[0].id, "bigint");
 });
 
+test("integers beyond Number.MAX_SAFE_INTEGER reject unless safeIntegers", async () => {
+  const sql = "SELECT 9007199254740992 AS big";
+  await assert.rejects(
+    exec(writer, sql),
+    (error) => error.message.includes("Value is too large to be represented as a JavaScript number: 9007199254740992"),
+  );
+  const edge = await exec(writer, "SELECT 9007199254740991 AS a, -9007199254740991 AS b");
+  assert.equal(edge[0].a, Number.MAX_SAFE_INTEGER);
+  assert.equal(edge[0].b, -Number.MAX_SAFE_INTEGER);
+  const safe = await exec(writer, sql, { safeIntegers: true });
+  assert.equal(safe[0].big, 9007199254740992n);
+  const after = await exec(writer, "SELECT 1 AS ok");
+  assert.equal(after[0].ok, 1);
+});
+
 test("values mode returns arrays", async () => {
   const rows = await exec(readers[1], "SELECT id, name FROM t ORDER BY id", { values: true });
   assert.deepEqual(rows, [[1, "seed"], [2, "alice"]]);

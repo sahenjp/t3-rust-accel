@@ -600,6 +600,14 @@ unsafe fn int_value(env: sys::napi_env, value: i64, safe: bool) -> Result<sys::n
       "napi_create_bigint_int64 failed",
     )?;
   } else {
+    // Match node:sqlite: never hand back a rounded id that still looks valid.
+    const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
+    if !(-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value) {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!("Value is too large to be represented as a JavaScript number: {value}"),
+      ));
+    }
     check_status!(
       sys::napi_create_double(env, value as f64, &mut out),
       "napi_create_double failed",
